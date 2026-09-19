@@ -1,0 +1,62 @@
+{
+  "type": "index_parallel",
+  "spec": {
+    "dataSchema": {
+      "dataSource": "hn_snapshots",
+      "timestampSpec": {
+        "column": "timestamp",
+        "format": "iso"
+      },
+      "dimensionsSpec": {
+        "dimensions": [
+          "post_id",
+          "author",
+          "source",
+          "subreddit",
+          "title",
+          "url",
+          "created_at"
+        ]
+      },
+      "metricsSpec": [
+        {
+          "type": "count",
+          "name": "count"
+        },
+        {
+          "type": "longSum",
+          "name": "score",
+          "fieldName": "score"
+        },
+        {
+          "type": "longSum",
+          "name": "num_comments",
+          "fieldName": "num_comments"
+        }
+      ],
+      "granularitySpec": {
+        "type": "uniform",
+        "segmentGranularity": "HOUR",
+        "queryGranularity": "NONE",
+        "rollup": false
+      }
+    },
+    "ioConfig": {
+      "type": "index_parallel",
+      "inputSource": {
+        "type": "local",
+        "baseDir": "/opt/shared",
+        "filter": "hn_snapshots.jsonl"
+      },
+      "inputFormat": {
+        "type": "json"
+      },
+      "appendToExisting": false
+    },
+    "tuningConfig": {
+      "type": "index_parallel",
+      "maxRowsInMemory": 100000,
+      "maxRowsPerSegment": 5000000
+    }
+  }
+}

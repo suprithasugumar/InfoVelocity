@@ -1,0 +1,14 @@
+# Python Virtual Environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secret Environment Variables
+.env
+
+# Collected Data & Logs
+collector.log
+*.log
+reddit_posts.jsonl
+reddit_events.jsonl
