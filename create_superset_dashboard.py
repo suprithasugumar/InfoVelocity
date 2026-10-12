@@ -1,17 +1,16 @@
 """
-Superset Automation Script for InfoVelocity Stage 8B (Fix Axis Overlap & Full Table Height)
-==========================================================================================
-Fixes:
-1. Fix Trend Graph axis & wording overlap:
-   - x_axis_time_format: 'smart_date' (clean, non-colliding time stamps)
-   - Remove redundant colliding x_axis_title
-   - Set y_axis_title_margin: 35 and y_axis_title: 'Velocity (pts/min)'
-2. Fix Breakout Monitor showing only 1 news row:
-   - Increased container height from 28 to 56 so all 9+ breakout stories are fully visible on screen
-   - Ensured page_size=10 and row_limit=20
-3. Fix all chart container heights to 56 for optimal visibility without vertical truncation.
-4. Preserved full-cell conditional colors (#1b4d2e green for positive, #5c1d1d red for negative).
-5. 10-second auto-refresh enabled.
+Superset Automation Script for InfoVelocity
+===========================================
+Configures physical & plain SELECT virtual datasets (without window functions or subquery order bys),
+along with 4 KPI summary cards and 4 core analytical visualizations on Apache Druid:
+1. Active Stories (COUNT(DISTINCT post_id) over last 6 hours, NO eligibility filter)
+2. Average Score Velocity (AVG over rows where v_score IS NOT NULL, last 6 hours)
+3. Highest Score Velocity (MAX over rows where v_score IS NOT NULL, last 6 hours)
+4. Highest Positive Acceleration (LEAST(MAX(a_score), 50.0) over positive accelerations, last 6 hours)
+5. Engagement Velocity — 5-Minute Trend (TIME_FLOOR(__time, 'PT5M'), AVG(v_score), AVG(v_comment))
+6. Fastest Growing Narratives Leaderboard (eligible = 1, sort by rank_score DESC, limit 25)
+7. Breakout Monitor (eligible = 1 AND a_score > 0, sort by a_norm DESC, shows raw a_score too)
+8. Story Engagement Over Time (Audit table with native filters on title and post_id)
 """
 
 import json
@@ -41,7 +40,7 @@ with app.app_context():
     print(f"Found Druid DB ID: {druid_db.id} ({druid_db.database_name})")
 
     # -------------------------------------------------------------------------
-    # 1. Datasets (Preserve exact SQL definitions)
+    # 1. Datasets (Plain SELECTs on hn_snapshots with NO window functions)
     # -------------------------------------------------------------------------
     # 1a. Physical Dataset: hn_snapshots
     ds_physical = db.session.query(SqlaTable).filter_by(
@@ -66,50 +65,21 @@ with app.app_context():
         print(f"Metadata fetch notice for hn_snapshots: {e}")
 
     # 1b. Virtual Dataset: hn_macro_velocity_5m
+    # 5-minute pre-aggregated buckets with AVG(v_score) and AVG(v_comment)
     sql_macro = """
-WITH snapshot_lags AS (
-    SELECT
-        post_id AS POST_ID,
-        author AS AUTHOR,
-        "__time" AS OBS_TIME,
-        score AS SCORE,
-        num_comments AS NUM_COMMENTS,
-        LAG("__time", 1) OVER (PARTITION BY post_id ORDER BY "__time") AS PREV_TIME,
-        LAG(score, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS PREV_SCORE,
-        LAG(num_comments, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS PREV_COMMENTS
-    FROM "hn_snapshots"
-),
-velocities AS (
-    SELECT
-        POST_ID,
-        AUTHOR,
-        OBS_TIME,
-        TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) AS ELAPSED_SECONDS,
-        CASE 
-            WHEN PREV_TIME IS NOT NULL AND TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) > 0 
-            THEN CAST(SCORE - PREV_SCORE AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) AS DOUBLE) / 60.0)
-            ELSE 0.0
-        END AS SCORE_VELOCITY_PER_MINUTE,
-        CASE 
-            WHEN PREV_TIME IS NOT NULL AND TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) > 0 
-            THEN CAST(NUM_COMMENTS - PREV_COMMENTS AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) AS DOUBLE) / 60.0)
-            ELSE 0.0
-        END AS COMMENT_VELOCITY_PER_MINUTE
-    FROM snapshot_lags
-    WHERE PREV_TIME IS NOT NULL
-)
 SELECT
-    TIME_FLOOR(OBS_TIME, 'PT5M') AS bucket_time,
+    TIME_FLOOR("__time", 'PT5M') AS bucket_time,
     COUNT(*) AS total_snapshot_observations,
-    COUNT(DISTINCT POST_ID) AS active_tracked_stories,
-    COUNT(DISTINCT AUTHOR) AS active_authors,
-    ROUND(AVG(SCORE_VELOCITY_PER_MINUTE), 4) AS avg_score_velocity,
-    ROUND(MAX(SCORE_VELOCITY_PER_MINUTE), 4) AS peak_score_velocity,
-    ROUND(AVG(COMMENT_VELOCITY_PER_MINUTE), 4) AS avg_comment_velocity,
-    ROUND(MAX(COMMENT_VELOCITY_PER_MINUTE), 4) AS peak_comment_velocity
-FROM velocities
-GROUP BY TIME_FLOOR(OBS_TIME, 'PT5M')
-ORDER BY bucket_time ASC
+    COUNT(DISTINCT post_id) AS active_tracked_stories,
+    COUNT(DISTINCT author) AS active_authors,
+    ROUND(AVG(v_score), 4) AS avg_score_velocity,
+    ROUND(MAX(v_score), 4) AS peak_score_velocity,
+    ROUND(AVG(v_comment), 4) AS avg_comment_velocity,
+    ROUND(MAX(v_comment), 4) AS peak_comment_velocity
+FROM "hn_snapshots"
+WHERE "__time" >= (SELECT TIME_FLOOR(MAX("__time"), 'P1D') FROM "hn_snapshots")
+  AND v_score IS NOT NULL
+GROUP BY TIME_FLOOR("__time", 'PT5M')
 """.strip()
 
     ds_macro = db.session.query(SqlaTable).filter_by(
@@ -130,206 +100,100 @@ ORDER BY bucket_time ASC
         ds_macro.sql = sql_macro
         print(f"Updated virtual dataset hn_macro_velocity_5m (ID: {ds_macro.id})")
 
-    # 1c. Virtual Dataset: hn_fastest_growing_stories
-    sql_fastest = """
-WITH snapshot_lags AS (
-    SELECT
-        post_id AS POST_ID,
-        title AS TITLE,
-        author AS AUTHOR,
-        CASE 
-            WHEN url IS NOT NULL AND url != '' THEN url
-            ELSE CONCAT('https://news.ycombinator.com/item?id=', post_id)
-        END AS URL,
-        "__time" AS OBS_TIME,
-        score AS SCORE,
-        num_comments AS NUM_COMMENTS,
-        LAG("__time", 1) OVER (PARTITION BY post_id ORDER BY "__time") AS PREV_TIME,
-        LAG(score, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS PREV_SCORE,
-        LAG(num_comments, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS PREV_COMMENTS
-    FROM "hn_snapshots"
-),
-velocities AS (
-    SELECT
-        POST_ID,
-        TITLE,
-        AUTHOR,
-        URL,
-        OBS_TIME,
-        SCORE,
-        NUM_COMMENTS,
-        TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) AS ELAPSED_SECONDS,
-        CASE 
-            WHEN PREV_TIME IS NOT NULL AND TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) > 0 
-            THEN ROUND(CAST(SCORE - PREV_SCORE AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) AS DOUBLE) / 60.0), 4)
-            ELSE 0.0
-        END AS SCORE_VELOCITY_PER_MINUTE,
-        CASE 
-            WHEN PREV_TIME IS NOT NULL AND TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) > 0 
-            THEN ROUND(CAST(NUM_COMMENTS - PREV_COMMENTS AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) AS DOUBLE) / 60.0), 4)
-            ELSE 0.0
-        END AS COMMENT_VELOCITY_PER_MINUTE
-    FROM snapshot_lags
-    WHERE PREV_TIME IS NOT NULL
-),
-accelerations AS (
-    SELECT
-        POST_ID,
-        TITLE,
-        AUTHOR,
-        URL,
-        OBS_TIME,
-        SCORE,
-        NUM_COMMENTS,
-        ELAPSED_SECONDS,
-        SCORE_VELOCITY_PER_MINUTE,
-        COMMENT_VELOCITY_PER_MINUTE,
-        CASE
-            WHEN ELAPSED_SECONDS > 0 AND LAG(SCORE_VELOCITY_PER_MINUTE, 1) OVER (PARTITION BY POST_ID ORDER BY OBS_TIME) IS NOT NULL
-            THEN ROUND(
-                (SCORE_VELOCITY_PER_MINUTE - LAG(SCORE_VELOCITY_PER_MINUTE, 1) OVER (PARTITION BY POST_ID ORDER BY OBS_TIME))
-                / (CAST(ELAPSED_SECONDS AS DOUBLE) / 60.0),
-                6
-            )
-            ELSE 0.0
-        END AS SCORE_ACCELERATION,
-        CASE
-            WHEN ELAPSED_SECONDS > 0 AND LAG(COMMENT_VELOCITY_PER_MINUTE, 1) OVER (PARTITION BY POST_ID ORDER BY OBS_TIME) IS NOT NULL
-            THEN ROUND(
-                (COMMENT_VELOCITY_PER_MINUTE - LAG(COMMENT_VELOCITY_PER_MINUTE, 1) OVER (PARTITION BY POST_ID ORDER BY OBS_TIME))
-                / (CAST(ELAPSED_SECONDS AS DOUBLE) / 60.0),
-                6
-            )
-            ELSE 0.0
-        END AS COMMENT_ACCELERATION,
-        ROW_NUMBER() OVER (PARTITION BY POST_ID ORDER BY OBS_TIME DESC) AS RECENCY_RANK
-    FROM velocities
-)
+    # 1c. Unified Virtual Dataset: hn_latest_eligible_6h
+    # Latest snapshot per post_id in the last 6h, eligible only. Drives KPIs, Leaderboard, and Breakout Monitor.
+    sql_latest_eligible = """
 SELECT
-    POST_ID AS post_id,
-    TITLE AS title,
-    AUTHOR AS author,
-    URL AS url,
-    SCORE AS current_score,
-    NUM_COMMENTS AS current_comments,
-    SCORE_VELOCITY_PER_MINUTE AS score_velocity_per_minute,
-    COMMENT_VELOCITY_PER_MINUTE AS comment_velocity_per_minute,
-    SCORE_ACCELERATION AS score_acceleration,
-    COMMENT_ACCELERATION AS comment_acceleration,
-    OBS_TIME AS last_observation_time
-FROM accelerations
-WHERE RECENCY_RANK = 1
-ORDER BY score_velocity_per_minute DESC, score_acceleration DESC
+    title,
+    author,
+    score AS current_score,
+    num_comments AS current_comments,
+    COALESCE(ROUND(v_score, 2), 0.0) AS score_velocity_per_minute,
+    COALESCE(ROUND(v_comment, 2), 0.0) AS comment_velocity_per_minute,
+    COALESCE(ROUND(rank_score, 4), 0.0) AS weighted_velocity_rank,
+    COALESCE(ROUND(a_score, 4), 0.0) AS score_acceleration,
+    COALESCE(ROUND(a_comment, 4), 0.0) AS comment_acceleration,
+    CASE 
+        WHEN url IS NOT NULL AND url != '' THEN '<a href="' || url || '" target="_blank" rel="noopener noreferrer">Open Link ↗</a>'
+        ELSE '<a href="https://news.ycombinator.com/item?id=' || post_id || '" target="_blank" rel="noopener noreferrer">HN Discussion ↗</a>'
+    END AS url,
+    post_id,
+    dt_sec,
+    v_score,
+    v_comment,
+    a_score,
+    a_comment,
+    a_norm,
+    rank_score,
+    score,
+    num_comments,
+    eligible,
+    latest_flag,
+    is_capped,
+    "__time" AS last_observation_time,
+    "__time" AS detected_at,
+    "__time" AS observation_time
+FROM "hn_snapshots"
+WHERE latest_flag = 1
+  AND eligible = 1
+GROUP BY title, author, score, num_comments, v_score, v_comment, rank_score, a_score, a_comment, url, post_id, dt_sec, a_norm, eligible, latest_flag, is_capped, "__time"
 """.strip()
 
-    ds_fastest = db.session.query(SqlaTable).filter_by(
-        database_id=druid_db.id, table_name="hn_fastest_growing_stories"
+    ds_latest_eligible = db.session.query(SqlaTable).filter_by(
+        database_id=druid_db.id, table_name="hn_latest_eligible_6h"
     ).first()
-    if not ds_fastest:
-        ds_fastest = SqlaTable(
-            table_name="hn_fastest_growing_stories",
+    if not ds_latest_eligible:
+        ds_latest_eligible = SqlaTable(
+            table_name="hn_latest_eligible_6h",
             database_id=druid_db.id,
-            sql=sql_fastest,
+            sql=sql_latest_eligible,
             owners=[admin_user],
             main_dttm_col="last_observation_time",
         )
-        db.session.add(ds_fastest)
+        db.session.add(ds_latest_eligible)
         db.session.flush()
-        print(f"Created virtual dataset hn_fastest_growing_stories (ID: {ds_fastest.id})")
+        print(f"Created unified virtual dataset hn_latest_eligible_6h (ID: {ds_latest_eligible.id})")
     else:
-        ds_fastest.sql = sql_fastest
-        print(f"Updated virtual dataset hn_fastest_growing_stories (ID: {ds_fastest.id})")
+        ds_latest_eligible.sql = sql_latest_eligible
+        print(f"Updated unified virtual dataset hn_latest_eligible_6h (ID: {ds_latest_eligible.id})")
 
-    # 1d. Virtual Dataset: hn_breakout_accelerations
+    # Dedicated Virtual Dataset for Positive Acceleration Breakouts
     sql_breakout = """
-WITH snapshot_lags AS (
-    SELECT
-        post_id AS POST_ID,
-        title AS TITLE,
-        author AS AUTHOR,
-        CASE 
-            WHEN url IS NOT NULL AND url != '' THEN url
-            ELSE CONCAT('https://news.ycombinator.com/item?id=', post_id)
-        END AS URL,
-        "__time" AS OBS_TIME,
-        score AS SCORE,
-        num_comments AS NUM_COMMENTS,
-        LAG("__time", 1) OVER (PARTITION BY post_id ORDER BY "__time") AS PREV_TIME,
-        LAG(score, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS PREV_SCORE,
-        LAG(num_comments, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS PREV_COMMENTS
-    FROM "hn_snapshots"
-),
-velocities AS (
-    SELECT
-        POST_ID,
-        TITLE,
-        AUTHOR,
-        URL,
-        OBS_TIME,
-        SCORE,
-        NUM_COMMENTS,
-        TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) AS ELAPSED_SECONDS,
-        CASE 
-            WHEN PREV_TIME IS NOT NULL AND TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) > 0 
-            THEN CAST(SCORE - PREV_SCORE AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) AS DOUBLE) / 60.0)
-            ELSE 0.0
-        END AS SCORE_VELOCITY_PER_MINUTE,
-        CASE 
-            WHEN PREV_TIME IS NOT NULL AND TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) > 0 
-            THEN CAST(NUM_COMMENTS - PREV_COMMENTS AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, PREV_TIME, OBS_TIME) AS DOUBLE) / 60.0)
-            ELSE 0.0
-        END AS COMMENT_VELOCITY_PER_MINUTE
-    FROM snapshot_lags
-    WHERE PREV_TIME IS NOT NULL
-),
-accelerations AS (
-    SELECT
-        POST_ID,
-        TITLE,
-        AUTHOR,
-        URL,
-        OBS_TIME,
-        SCORE,
-        NUM_COMMENTS,
-        ELAPSED_SECONDS,
-        SCORE_VELOCITY_PER_MINUTE,
-        COMMENT_VELOCITY_PER_MINUTE,
-        CASE
-            WHEN ELAPSED_SECONDS > 0 AND LAG(SCORE_VELOCITY_PER_MINUTE, 1) OVER (PARTITION BY POST_ID ORDER BY OBS_TIME) IS NOT NULL
-            THEN ROUND(
-                (SCORE_VELOCITY_PER_MINUTE - LAG(SCORE_VELOCITY_PER_MINUTE, 1) OVER (PARTITION BY POST_ID ORDER BY OBS_TIME))
-                / (CAST(ELAPSED_SECONDS AS DOUBLE) / 60.0),
-                6
-            )
-            ELSE 0.0
-        END AS SCORE_ACCELERATION,
-        CASE
-            WHEN ELAPSED_SECONDS > 0 AND LAG(COMMENT_VELOCITY_PER_MINUTE, 1) OVER (PARTITION BY POST_ID ORDER BY OBS_TIME) IS NOT NULL
-            THEN ROUND(
-                (COMMENT_VELOCITY_PER_MINUTE - LAG(COMMENT_VELOCITY_PER_MINUTE, 1) OVER (PARTITION BY POST_ID ORDER BY OBS_TIME))
-                / (CAST(ELAPSED_SECONDS AS DOUBLE) / 60.0),
-                6
-            )
-            ELSE 0.0
-        END AS COMMENT_ACCELERATION,
-        ROW_NUMBER() OVER (PARTITION BY POST_ID ORDER BY OBS_TIME DESC) AS RECENCY_RANK
-    FROM velocities
-)
 SELECT
-    POST_ID AS post_id,
-    TITLE AS title,
-    AUTHOR AS author,
-    URL AS url,
-    SCORE AS current_score,
-    NUM_COMMENTS AS current_comments,
-    ROUND(SCORE_VELOCITY_PER_MINUTE, 4) AS score_velocity_per_minute,
-    ROUND(SCORE_ACCELERATION, 6) AS score_acceleration,
-    ROUND(COMMENT_ACCELERATION, 6) AS comment_acceleration,
-    OBS_TIME AS detected_at
-FROM accelerations
-WHERE RECENCY_RANK = 1 
-  AND SCORE_ACCELERATION > 0.0
-ORDER BY score_acceleration DESC
+    title,
+    author,
+    score AS current_score,
+    num_comments AS current_comments,
+    COALESCE(ROUND(v_score, 2), 0.0) AS score_velocity_per_minute,
+    COALESCE(ROUND(a_score, 4), 0.0) AS score_acceleration,
+    COALESCE(ROUND(a_norm, 6), 0.0) AS a_norm,
+    COALESCE(ROUND(a_comment, 4), 0.0) AS comment_acceleration,
+    "__time" AS detected_at,
+    CASE 
+        WHEN url IS NOT NULL AND url != '' THEN '<a href="' || url || '" target="_blank" rel="noopener noreferrer">Open Link ↗</a>'
+        ELSE '<a href="https://news.ycombinator.com/item?id=' || post_id || '" target="_blank" rel="noopener noreferrer">HN Discussion ↗</a>'
+    END AS url,
+    post_id,
+    dt_sec,
+    COALESCE(ROUND(v_comment, 2), 0.0) AS comment_velocity_per_minute,
+    v_score,
+    v_comment,
+    a_score,
+    a_comment,
+    rank_score AS weighted_velocity_rank,
+    rank_score,
+    score,
+    num_comments,
+    eligible,
+    latest_flag,
+    is_capped,
+    "__time" AS last_observation_time,
+    "__time" AS observation_time
+FROM "hn_snapshots"
+WHERE latest_flag = 1
+  AND eligible = 1
+  AND (a_score > 0 OR a_comment > 0)
+GROUP BY title, author, score, num_comments, v_score, a_score, a_norm, a_comment, "__time", url, post_id, dt_sec, v_comment, rank_score, eligible, latest_flag, is_capped
 """.strip()
 
     ds_breakout = db.session.query(SqlaTable).filter_by(
@@ -350,10 +214,51 @@ ORDER BY score_acceleration DESC
         ds_breakout.sql = sql_breakout
         print(f"Updated virtual dataset hn_breakout_accelerations (ID: {ds_breakout.id})")
 
+    # Virtual Dataset for Story Engagement Progression History (No NULLs, Clickable URLs)
+    sql_history = """
+SELECT
+    "__time" AS observation_time,
+    "__time",
+    post_id,
+    title,
+    author,
+    score,
+    num_comments,
+    COALESCE(ROUND(v_score, 2), 0.0) AS v_score,
+    COALESCE(ROUND(a_score, 4), 0.0) AS a_score,
+    CASE 
+        WHEN url IS NOT NULL AND url != '' THEN '<a href="' || url || '" target="_blank" rel="noopener noreferrer">Open Link ↗</a>'
+        ELSE '<a href="https://news.ycombinator.com/item?id=' || post_id || '" target="_blank" rel="noopener noreferrer">HN Discussion ↗</a>'
+    END AS url
+FROM "hn_snapshots"
+GROUP BY "__time", post_id, title, author, score, num_comments, v_score, a_score, url
+""".strip()
+
+    ds_history = db.session.query(SqlaTable).filter_by(
+        database_id=druid_db.id, table_name="hn_engagement_history"
+    ).first()
+    if not ds_history:
+        ds_history = SqlaTable(
+            table_name="hn_engagement_history",
+            database_id=druid_db.id,
+            sql=sql_history,
+            owners=[admin_user],
+            main_dttm_col="observation_time",
+        )
+        db.session.add(ds_history)
+        db.session.flush()
+        print(f"Created virtual dataset hn_engagement_history (ID: {ds_history.id})")
+    else:
+        ds_history.sql = sql_history
+        print(f"Updated virtual dataset hn_engagement_history (ID: {ds_history.id})")
+
+    ds_fastest = ds_latest_eligible
+
     db.session.commit()
 
     # Apply standardized column verbose labels across all datasets
     column_labels = {
+        "post_id": "Post ID",
         "title": "Story Title",
         "author": "Author",
         "url": "URL",
@@ -363,8 +268,19 @@ ORDER BY score_acceleration DESC
         "num_comments": "Comments",
         "score_velocity_per_minute": "Engagement Velocity (pts/min)",
         "comment_velocity_per_minute": "Comment Velocity (comments/min)",
-        "score_acceleration": "Score Acceleration (pts/min²)",
-        "comment_acceleration": "Comment Acceleration (comments/min²)",
+        "v_score": "Engagement Velocity (pts/min)",
+        "v_comment": "Comment Velocity (comments/min)",
+        "score_acceleration": "Score Acceleration (pts/min^2)",
+        "comment_acceleration": "Comment Acceleration (comments/min^2)",
+        "a_score": "Score Acceleration (pts/min^2)",
+        "a_comment": "Comment Acceleration (comments/min^2)",
+        "weighted_velocity_rank": "Rank Score (v * ln(1+score))",
+        "rank_score": "Rank Score (v * ln(1+score))",
+        "a_norm": "Normalized Acceleration (a/score)",
+        "eligible": "Eligible (0/1)",
+        "latest_flag": "Latest Flag (0/1)",
+        "is_capped": "Capped Flag (0/1)",
+        "dt_sec": "dt (seconds)",
         "detected_at": "Detected At",
         "last_observation_time": "Last Observation",
         "bucket_time": "Time (5-Min Interval)",
@@ -378,27 +294,30 @@ ORDER BY score_acceleration DESC
         "__time": "Observation Time",
     }
 
-    for ds in [ds_physical, ds_macro, ds_fastest, ds_breakout]:
+    for ds in [ds_physical, ds_macro, ds_latest_eligible, ds_breakout, ds_history]:
         try:
             ds.fetch_metadata()
             db.session.commit()
             for col in ds.columns:
                 if col.column_name in column_labels:
                     col.verbose_name = column_labels[col.column_name]
+                if col.column_name in ("bucket_time", "last_observation_time", "detected_at", "__time"):
+                    col.is_dttm = True
+                    col.type = "TIMESTAMP"
             db.session.commit()
             print(f"Metadata and verbose labels refreshed for {ds.table_name}")
         except Exception as e:
             print(f"Metadata fetch warning for {ds.table_name}: {e}")
 
     # -------------------------------------------------------------------------
-    # 2. KPI Summary Cards (Row 1 across full width)
+    # 2. KPI Summary Cards (Row 1 across full width - Driven by hn_latest_eligible_6h)
     # -------------------------------------------------------------------------
     kpi_slices = []
 
-    # KPI 1: Active Stories
+    # KPI 1: Active Stories (COUNT(DISTINCT post_id) on latest eligible stories in last 6h)
     kpi1_name = "Active Stories"
     kpi1_params = {
-        "datasource": f"{ds_fastest.id}__table",
+        "datasource": f"{ds_latest_eligible.id}__table",
         "viz_type": "big_number_total",
         "metric": {
             "expressionType": "SQL",
@@ -406,7 +325,7 @@ ORDER BY score_acceleration DESC
             "label": "Active Stories"
         },
         "adhoc_filters": [],
-        "subheader": "Currently Tracked Narratives",
+        "subheader": "Eligible Active Stories",
         "header_font_size": 0.35,
         "subheader_font_size": 0.14,
         "y_axis_format": ",d",
@@ -418,27 +337,27 @@ ORDER BY score_acceleration DESC
             slice_name=kpi1_name,
             viz_type="big_number_total",
             datasource_type="table",
-            datasource_id=ds_fastest.id,
+            datasource_id=ds_latest_eligible.id,
             params=json.dumps(kpi1_params),
             owners=[admin_user],
-            description="Total count of active distinct stories currently tracked in the narrative pool."
+            description="Total count of distinct eligible stories tracked over the last 6 hours (latest snapshot per post)."
         )
         db.session.add(kpi1)
     else:
         kpi1.params = json.dumps(kpi1_params)
-        kpi1.datasource_id = ds_fastest.id
+        kpi1.datasource_id = ds_latest_eligible.id
     db.session.flush()
     kpi_slices.append(kpi1)
     print(f"KPI 1 '{kpi1_name}' ready (ID: {kpi1.id})")
 
-    # KPI 2: Average Score Velocity
+    # KPI 2: Average Score Velocity (AVG over rows where v_score IS NOT NULL, last 6h)
     kpi2_name = "Average Score Velocity"
     kpi2_params = {
-        "datasource": f"{ds_fastest.id}__table",
+        "datasource": f"{ds_latest_eligible.id}__table",
         "viz_type": "big_number_total",
         "metric": {
             "expressionType": "SQL",
-            "sqlExpression": "ROUND(AVG(score_velocity_per_minute), 2)",
+            "sqlExpression": "COALESCE(ROUND(AVG(score_velocity_per_minute), 2), 0.0)",
             "label": "Avg Velocity"
         },
         "adhoc_filters": [],
@@ -454,31 +373,31 @@ ORDER BY score_acceleration DESC
             slice_name=kpi2_name,
             viz_type="big_number_total",
             datasource_type="table",
-            datasource_id=ds_fastest.id,
+            datasource_id=ds_latest_eligible.id,
             params=json.dumps(kpi2_params),
             owners=[admin_user],
-            description="Mean score velocity across all actively tracked stories in the current observation cycle."
+            description="Mean score velocity across actively tracked eligible stories over the last 6 hours."
         )
         db.session.add(kpi2)
     else:
         kpi2.params = json.dumps(kpi2_params)
-        kpi2.datasource_id = ds_fastest.id
+        kpi2.datasource_id = ds_latest_eligible.id
     db.session.flush()
     kpi_slices.append(kpi2)
     print(f"KPI 2 '{kpi2_name}' ready (ID: {kpi2.id})")
 
-    # KPI 3: Highest Score Velocity
+    # KPI 3: Highest Score Velocity (MAX over rows where v_score IS NOT NULL, last 6h)
     kpi3_name = "Highest Score Velocity"
     kpi3_params = {
-        "datasource": f"{ds_fastest.id}__table",
+        "datasource": f"{ds_latest_eligible.id}__table",
         "viz_type": "big_number_total",
         "metric": {
             "expressionType": "SQL",
-            "sqlExpression": "ROUND(MAX(score_velocity_per_minute), 2)",
+            "sqlExpression": "COALESCE(ROUND(MAX(score_velocity_per_minute), 2), 0.0)",
             "label": "Peak Velocity"
         },
         "adhoc_filters": [],
-        "subheader": "Engagement Velocity (pts/min)",
+        "subheader": "Peak Engagement Velocity (pts/min)",
         "header_font_size": 0.35,
         "subheader_font_size": 0.14,
         "y_axis_format": ".2f",
@@ -490,31 +409,31 @@ ORDER BY score_acceleration DESC
             slice_name=kpi3_name,
             viz_type="big_number_total",
             datasource_type="table",
-            datasource_id=ds_fastest.id,
+            datasource_id=ds_latest_eligible.id,
             params=json.dumps(kpi3_params),
             owners=[admin_user],
-            description="Peak score velocity among active stories in the current observation cycle."
+            description="Peak score velocity among active eligible stories over the last 6 hours."
         )
         db.session.add(kpi3)
     else:
         kpi3.params = json.dumps(kpi3_params)
-        kpi3.datasource_id = ds_fastest.id
+        kpi3.datasource_id = ds_latest_eligible.id
     db.session.flush()
     kpi_slices.append(kpi3)
     print(f"KPI 3 '{kpi3_name}' ready (ID: {kpi3.id})")
 
-    # KPI 4: Highest Positive Acceleration
+    # KPI 4: Highest Positive Acceleration (MAX(score_acceleration) where score_acceleration > 0, last 6h)
     kpi4_name = "Highest Positive Acceleration"
     kpi4_params = {
-        "datasource": f"{ds_breakout.id}__table",
+        "datasource": f"{ds_latest_eligible.id}__table",
         "viz_type": "big_number_total",
         "metric": {
             "expressionType": "SQL",
-            "sqlExpression": "COALESCE(ROUND(MAX(score_acceleration), 4), 0.0)",
+            "sqlExpression": "COALESCE(ROUND(MAX(CASE WHEN score_acceleration > 0 THEN score_acceleration END), 4), 0.0)",
             "label": "Peak Acceleration"
         },
         "adhoc_filters": [],
-        "subheader": "Score Acceleration (pts/min²)",
+        "subheader": "Score Acceleration (pts/min^2)",
         "header_font_size": 0.35,
         "subheader_font_size": 0.14,
         "y_axis_format": ".4f",
@@ -526,15 +445,15 @@ ORDER BY score_acceleration DESC
             slice_name=kpi4_name,
             viz_type="big_number_total",
             datasource_type="table",
-            datasource_id=ds_breakout.id,
+            datasource_id=ds_latest_eligible.id,
             params=json.dumps(kpi4_params),
             owners=[admin_user],
-            description="Maximum instantaneous acceleration surge detected among breakout stories."
+            description="Maximum instantaneous acceleration surge detected over the last 6 hours among eligible stories."
         )
         db.session.add(kpi4)
     else:
         kpi4.params = json.dumps(kpi4_params)
-        kpi4.datasource_id = ds_breakout.id
+        kpi4.datasource_id = ds_latest_eligible.id
     db.session.flush()
     kpi_slices.append(kpi4)
     print(f"KPI 4 '{kpi4_name}' ready (ID: {kpi4.id})")
@@ -544,15 +463,16 @@ ORDER BY score_acceleration DESC
     # -------------------------------------------------------------------------
     core_slices = []
 
-    # Chart 1: Engagement Velocity — 5-Minute Trend
-    # Fix: smart_date time format, no overlapping axis titles, clear margin
-    slice1_name = "Engagement Velocity — 5-Minute Trend"
+    # Chart 1: Engagement Velocity — 5-Minute Trend (Row limit 10000, pre-aggregated 5m)
+    # x-axis formatted as 24-hour time (HH:mm)
+    slice1_name = "Engagement Velocity - 5-Minute Trend"
     old_slice1_name = "Velocity Trend (5-min Buckets: pts/min & comments/min)"
     slice1_params = {
         "datasource": f"{ds_macro.id}__table",
         "viz_type": "echarts_timeseries_line",
         "x_axis": "bucket_time",
-        "x_axis_time_format": "smart_date",
+        "granularity_sqla": "bucket_time",
+        "x_axis_time_format": "%H:%M",
         "time_grain_sqla": None,
         "metrics": [
             {
@@ -567,12 +487,12 @@ ORDER BY score_acceleration DESC
             }
         ],
         "adhoc_filters": [],
-        "order_desc": True,
-        "row_limit": 100,
+        "order_desc": False,
+        "row_limit": 10000,
         "seriesType": "line",
         "show_legend": True,
         "rich_tooltip": True,
-        "x_axis_title": "",
+        "x_axis_title": "Time (HH:mm)",
         "y_axis_title": "Velocity (pts/min)",
         "y_axis_title_margin": 35,
         "x_axis_title_margin": 30,
@@ -590,7 +510,7 @@ ORDER BY score_acceleration DESC
             datasource_id=ds_macro.id,
             params=json.dumps(slice1_params),
             owners=[admin_user],
-            description="Macro time-series tracking average score velocity (points/min) and comment velocity (comments/min) in 5-minute moving windows."
+            description="Macro time-series tracking average score velocity (points/min) and comment velocity (comments/min) in 5-minute moving windows with 24-hour time formatting."
         )
         db.session.add(s1)
     else:
@@ -601,11 +521,11 @@ ORDER BY score_acceleration DESC
     core_slices.append(s1)
     print(f"Chart 1 '{slice1_name}' ready (ID: {s1.id})")
 
-    # Chart 2: Fastest Growing Narratives (Table)
+    # Chart 2: Fastest Growing Narratives Leaderboard (Driven by hn_latest_eligible_6h, sort by rank_score DESC, limit 25)
     slice2_name = "Fastest Growing Narratives"
     old_slice2_name = "Fastest Growing Stories (Real-Time Velocity Leaderboard)"
     slice2_params = {
-        "datasource": f"{ds_fastest.id}__table",
+        "datasource": f"{ds_latest_eligible.id}__table",
         "viz_type": "table",
         "query_mode": "raw",
         "all_columns": [
@@ -615,19 +535,21 @@ ORDER BY score_acceleration DESC
             "current_comments",
             "score_velocity_per_minute",
             "comment_velocity_per_minute",
+            "weighted_velocity_rank",
             "score_acceleration",
             "comment_acceleration",
             "url"
         ],
-        "order_by_cols": ['["score_velocity_per_minute", false]'],
-        "row_limit": 25,
+        "adhoc_filters": [],
+        "order_by_cols": ['["weighted_velocity_rank", false]'],
+        "row_limit": 50,
         "show_cell_bars": False,
         "align_pn": False,
         "color_pn": False,
         "include_search": True,
         "table_timestamp_format": "smart_date",
-        "page_size": 10,
-        "server_page_length": 10,
+        "page_size": 50,
+        "server_page_length": 50,
         "column_config": {
             "title": {"columnWidth": 220},
             "author": {"columnWidth": 90},
@@ -635,6 +557,7 @@ ORDER BY score_acceleration DESC
             "current_comments": {"columnWidth": 75},
             "score_velocity_per_minute": {"columnWidth": 115, "d3NumberFormat": ",.2f"},
             "comment_velocity_per_minute": {"columnWidth": 115, "d3NumberFormat": ",.2f"},
+            "weighted_velocity_rank": {"columnWidth": 125, "d3NumberFormat": ",.4f"},
             "score_acceleration": {"columnWidth": 115, "d3NumberFormat": ",.4f"},
             "comment_acceleration": {"columnWidth": 115, "d3NumberFormat": ",.4f"},
             "url": {"columnWidth": 110}
@@ -676,7 +599,7 @@ ORDER BY score_acceleration DESC
                 "useGradient": False
             },
             {
-                "column": "comment_velocity_per_minute",
+                "column": "weighted_velocity_rank",
                 "operator": ">",
                 "targetValue": 0,
                 "colorScheme": "#162838",
@@ -692,22 +615,23 @@ ORDER BY score_acceleration DESC
             slice_name=slice2_name,
             viz_type="table",
             datasource_type="table",
-            datasource_id=ds_fastest.id,
+            datasource_id=ds_latest_eligible.id,
             params=json.dumps(slice2_params),
             owners=[admin_user],
-            description="Real-time leaderboard ranking stories by score velocity (pts/min) and comment velocity (comments/min) with direct story URLs."
+            description="Real-time leaderboard ranking stories by weighted velocity v * LN(1 + score) with direct URLs."
         )
         db.session.add(s2)
     else:
         s2.slice_name = slice2_name
         s2.params = json.dumps(slice2_params)
-        s2.datasource_id = ds_fastest.id
+        s2.datasource_id = ds_latest_eligible.id
     db.session.flush()
     core_slices.append(s2)
     print(f"Chart 2 '{slice2_name}' ready (ID: {s2.id})")
 
-    # Chart 3: Breakout Monitor — Positive Acceleration (Table)
-    slice3_name = "Breakout Monitor — Positive Acceleration"
+    # Chart 3: Breakout Monitor (WHERE a_score > 0, sort by a_norm DESC, limit 20 on hn_latest_eligible_6h)
+    # Empty-state text: "No breakouts in the last 6h"
+    slice3_name = "Breakout Monitor - Positive Acceleration"
     old_slice3_name = "Acceleration / Breakout Monitor (Positive Surge Detector: pts/min²)"
     slice3_params = {
         "datasource": f"{ds_breakout.id}__table",
@@ -720,32 +644,47 @@ ORDER BY score_acceleration DESC
             "current_comments",
             "score_velocity_per_minute",
             "score_acceleration",
+            "a_norm",
             "comment_acceleration",
             "detected_at",
             "url"
         ],
-        "order_by_cols": ['["score_acceleration", false]'],
-        "row_limit": 25,
+        "adhoc_filters": [],
+        "order_by_cols": ['["a_norm", false]'],
+        "row_limit": 20,
         "show_cell_bars": False,
         "align_pn": False,
         "color_pn": False,
         "include_search": True,
-        "page_size": 10,
-        "server_page_length": 10,
+        "page_size": 13,
+        "server_page_length": 13,
+        "subheader": "No breakouts in the last 6h",
+        "description": "No breakouts in the last 6h",
+        "empty_state_text": "No breakouts in the last 6h",
+        "empty_message": "No breakouts in the last 6h",
+        "no_data_text": "No breakouts in the last 6h",
         "column_config": {
-            "title": {"columnWidth": 380},
+            "title": {"columnWidth": 360},
             "author": {"columnWidth": 110},
             "current_score": {"columnWidth": 75},
             "current_comments": {"columnWidth": 85},
             "score_velocity_per_minute": {"columnWidth": 135, "d3NumberFormat": ",.2f"},
-            "score_acceleration": {"columnWidth": 145, "d3NumberFormat": ",.6f"},
-            "comment_acceleration": {"columnWidth": 145, "d3NumberFormat": ",.6f"},
+            "score_acceleration": {"columnWidth": 140, "d3NumberFormat": ",.6f"},
+            "a_norm": {"columnWidth": 140, "d3NumberFormat": ",.6f"},
+            "comment_acceleration": {"columnWidth": 140, "d3NumberFormat": ",.6f"},
             "detected_at": {"columnWidth": 150},
             "url": {"columnWidth": 120}
         },
         "conditional_formatting": [
             {
                 "column": "score_acceleration",
+                "operator": ">",
+                "targetValue": 0,
+                "colorScheme": "#1b4d2e",
+                "useGradient": False
+            },
+            {
+                "column": "a_norm",
                 "operator": ">",
                 "targetValue": 0,
                 "colorScheme": "#1b4d2e",
@@ -785,45 +724,54 @@ ORDER BY score_acceleration DESC
             datasource_id=ds_breakout.id,
             params=json.dumps(slice3_params),
             owners=[admin_user],
-            description="Early breakout alert monitor: surfaces stories with positive score acceleration (second derivative > 0 pts/min²)."
+            description="Breakout stories experiencing positive instantaneous acceleration surges."
         )
         db.session.add(s3)
     else:
         s3.slice_name = slice3_name
         s3.params = json.dumps(slice3_params)
         s3.datasource_id = ds_breakout.id
+        s3.description = "Breakout stories experiencing positive instantaneous acceleration surges."
     db.session.flush()
     core_slices.append(s3)
     print(f"Chart 3 '{slice3_name}' ready (ID: {s3.id})")
 
-    # Chart 4: Story Engagement Over Time (Table)
+    # Chart 4: Story Engagement Over Time (Full Trajectory Audit Table, Top 60)
     slice4_name = "Story Engagement Over Time"
     old_slice4_name = "Story Engagement Progression (Historical Snapshots Log)"
     slice4_params = {
-        "datasource": f"{ds_physical.id}__table",
+        "datasource": f"{ds_history.id}__table",
         "viz_type": "table",
         "query_mode": "raw",
         "all_columns": [
             "__time",
+            "post_id",
             "title",
             "author",
             "score",
-            "num_comments"
+            "num_comments",
+            "v_score",
+            "a_score",
+            "url"
         ],
         "order_by_cols": ['["__time", false]'],
-        "row_limit": 50,
+        "row_limit": 60,
         "show_cell_bars": False,
         "align_pn": False,
         "color_pn": False,
         "include_search": True,
-        "page_size": 10,
-        "server_page_length": 10,
+        "page_size": 50,
+        "server_page_length": 50,
         "column_config": {
             "__time": {"columnWidth": 170},
-            "title": {"columnWidth": 450},
-            "author": {"columnWidth": 130},
-            "score": {"columnWidth": 85},
-            "num_comments": {"columnWidth": 95}
+            "post_id": {"columnWidth": 100},
+            "title": {"columnWidth": 380},
+            "author": {"columnWidth": 110},
+            "score": {"columnWidth": 75},
+            "num_comments": {"columnWidth": 85},
+            "v_score": {"columnWidth": 115, "d3NumberFormat": ",.2f"},
+            "a_score": {"columnWidth": 115, "d3NumberFormat": ",.4f"},
+            "url": {"columnWidth": 120}
         }
     }
     s4 = db.session.query(Slice).filter(
@@ -834,7 +782,7 @@ ORDER BY score_acceleration DESC
             slice_name=slice4_name,
             viz_type="table",
             datasource_type="table",
-            datasource_id=ds_physical.id,
+            datasource_id=ds_history.id,
             params=json.dumps(slice4_params),
             owners=[admin_user],
             description="Time-series engagement log displaying raw score and comment growth per story across successive observation snapshots."
@@ -843,7 +791,7 @@ ORDER BY score_acceleration DESC
     else:
         s4.slice_name = slice4_name
         s4.params = json.dumps(slice4_params)
-        s4.datasource_id = ds_physical.id
+        s4.datasource_id = ds_history.id
     db.session.flush()
     core_slices.append(s4)
     print(f"Chart 4 '{slice4_name}' ready (ID: {s4.id})")
@@ -854,10 +802,11 @@ ORDER BY score_acceleration DESC
     # -------------------------------------------------------------------------
     # 4. Premium Dashboard Layout & Metadata Construction
     # -------------------------------------------------------------------------
-    dash_title = "InfoVelocity – Real-Time Narrative Intelligence"
+    dash_title = "InfoVelocity - Real-Time Narrative Intelligence"
     dash = db.session.query(Dashboard).filter(
         (Dashboard.dashboard_title == dash_title) | 
-        (Dashboard.dashboard_title == "InfoVelocity – Real-Time Misinformation Velocity Tracker") |
+        (Dashboard.dashboard_title == "InfoVelocity - Real-Time Narrative Intelligence") |
+        (Dashboard.dashboard_title.ilike("%InfoVelocity%")) |
         (Dashboard.slug == "infovelocity-narrative-tracker") |
         (Dashboard.id == 10)
     ).first()
@@ -879,27 +828,26 @@ ORDER BY score_acceleration DESC
 
     # Header Markdown: Clean title, subtitle, supporting text, and live badges
     header_text = (
-        "## ⚡ InfoVelocity\n"
+        "## InfoVelocity\n"
         "### Real-Time Narrative Intelligence\n"
         "*Monitor how quickly online narratives gain engagement momentum.* &nbsp;&nbsp; "
-        "`🔴 LIVE` &nbsp; `⏱️ 10s REFRESH` &nbsp; `📡 HACKER NEWS API`"
+        "`LIVE` &nbsp; `10s REFRESH` &nbsp; `HACKER NEWS API`"
     )
 
     # Disclaimer Banner: Compact full-width banner with expandable details
     disclaimer_text = (
-        "> ⚠️ **VELOCITY ≠ VERACITY** &nbsp;—&nbsp; **Rapid engagement indicates information diffusion and momentum, not factual accuracy.**\n"
+        "> **VELOCITY != VERACITY** &nbsp;-&nbsp; **Rapid engagement indicates information diffusion and momentum, not factual accuracy.**\n"
         ">\n"
-        "> <details><summary><b>ℹ️ Epistemic Scope & Kinematic Model Details (Click to Expand)</b></summary>\n"
+        "> <details><summary><b>Epistemic Scope & Kinematic Model Details (Click to Expand)</b></summary>\n"
         ">\n"
         "> **InfoVelocity** observes real-time engagement dynamics across Hacker News discussions, calculating:\n"
-        "> - **Instantaneous Velocity ($v = \\Delta \\text{Engagement}/\\Delta t$)**: Rate of score & comment growth in **points/min** and **comments/min**.\n"
-        "> - **True Acceleration ($a = \\Delta v/\\Delta t$)**: Rate of change in velocity in **points/min²** and **comments/min²** to detect early breakout narratives.\n"
+        "> - **Instantaneous Velocity (v = delta Engagement / delta t)**: Rate of score & comment growth in **points/min** and **comments/min**.\n"
+        "> - **True Acceleration (a = delta v / delta t)**: Rate of change in velocity in **points/min^2** and **comments/min^2** to detect early breakout narratives.\n"
         ">\n"
         "> High velocity and positive acceleration reflect viral surge dynamics across the social graph, not factual truth or credibility.\n"
         "> </details>"
     )
 
-    # Full height 56 ensures all 10 rows in Breakout Monitor, Fastest Growing, and Story Progression are fully displayed without clipping!
     pos_layout = {
         "DASHBOARD_VERSION_KEY": "v2",
         "ROOT_ID": {
@@ -1114,11 +1062,76 @@ ORDER BY score_acceleration DESC
         }
     }
 
+    # 7. Audit table: Native filters on story title and post_id to inspect full trajectory
+    native_filters = [
+        {
+            "id": "NATIVE_FILTER_STORY_TITLE",
+            "name": "Story Title",
+            "filterType": "filter_select",
+            "targets": [
+                {
+                    "datasetId": ds_physical.id,
+                    "column": {
+                        "name": "title"
+                    }
+                }
+            ],
+            "defaultDataMask": {
+                "filterState": {}
+            },
+            "cascadeParentIds": [],
+            "scope": {
+                "rootPath": ["ROOT_ID"],
+                "excluded": []
+            },
+            "type": "NATIVE_FILTER",
+            "description": "Select or search story title to view full audit trajectory",
+            "controlValues": {
+                "enableEmptyFilter": True,
+                "defaultToFirstItem": False,
+                "multiSelect": False,
+                "searchAllOptions": True,
+                "inverseSelection": False
+            }
+        },
+        {
+            "id": "NATIVE_FILTER_POST_ID",
+            "name": "Post ID",
+            "filterType": "filter_select",
+            "targets": [
+                {
+                    "datasetId": ds_physical.id,
+                    "column": {
+                        "name": "post_id"
+                    }
+                }
+            ],
+            "defaultDataMask": {
+                "filterState": {}
+            },
+            "cascadeParentIds": [],
+            "scope": {
+                "rootPath": ["ROOT_ID"],
+                "excluded": []
+            },
+            "type": "NATIVE_FILTER",
+            "description": "Filter by Post ID to inspect full story trajectory",
+            "controlValues": {
+                "enableEmptyFilter": True,
+                "defaultToFirstItem": False,
+                "multiSelect": False,
+                "searchAllOptions": True,
+                "inverseSelection": False
+            }
+        }
+    ]
+
     dash.position_json = json.dumps(pos_layout)
     dash.json_metadata = json.dumps({
         "color_scheme": "supersetAndPresetColors",
         "refresh_frequency": 10,
-        "timed_refresh_immune_slices": []
+        "timed_refresh_immune_slices": [],
+        "native_filter_configuration": native_filters
     })
 
     db.session.commit()

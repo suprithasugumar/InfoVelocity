@@ -11,6 +11,13 @@ def execute_query(sql: str):
         return None
 
 if __name__ == "__main__":
-    query = 'SELECT __time, post_id, author, source, title, url, score, num_comments, created_at FROM "hn_snapshots" LIMIT 5'
+    query = 'SELECT __time, post_id, author, source, title, url, score, num_comments, v_score, a_score FROM "hn_snapshots" WHERE v_score IS NOT NULL LIMIT 5'
     data = execute_query(query)
     print(json.dumps(data, indent=2))
+
+
+
+
+
+
+

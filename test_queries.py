@@ -2,13 +2,8 @@
 """
 Test Suite: InfoVelocity Druid SQL Queries for Velocity & Acceleration
 =====================================================================
-Executes Queries 1 through 5 against Apache Druid's SQL endpoint (port 8888).
-
-Units & Physical Dimensions:
-  - score_velocity_per_minute   : score points per minute
-  - comment_velocity_per_minute : comments per minute
-  - score_acceleration          : score points per minute²  (Δvelocity / Δt)
-  - comment_acceleration        : comments per minute²      (Δvelocity / Δt)
+Executes Queries 1 through 6 against Apache Druid's SQL endpoint (port 8888).
+Tests plain SELECT queries without window functions or subquery order bys.
 """
 
 import os
@@ -21,298 +16,127 @@ QUERIES = [
     (
         "Query 1: Instantaneous Story Velocity",
         """
-        WITH snapshot_lags AS (
-            SELECT
-                post_id, title, author,
-                CASE 
-                    WHEN url IS NOT NULL AND url != '' THEN url
-                    ELSE CONCAT('https://news.ycombinator.com/item?id=', post_id)
-                END AS url,
-                "__time", score, num_comments,
-                LAG("__time", 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_time,
-                LAG(score, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_score,
-                LAG(num_comments, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_comments
-            FROM "hn_snapshots"
-        ),
-        velocities AS (
-            SELECT
-                post_id, title, author, url, "__time", score, num_comments,
-                (score - prev_score) AS score_delta,
-                (num_comments - prev_comments) AS comment_delta,
-                TIMESTAMPDIFF(SECOND, prev_time, "__time") AS elapsed_seconds,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN ROUND(CAST(score - prev_score AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0), 4)
-                    ELSE 0.0
-                END AS score_velocity_per_minute,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN ROUND(CAST(num_comments - prev_comments AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0), 4)
-                    ELSE 0.0
-                END AS comment_velocity_per_minute
-            FROM snapshot_lags
-            WHERE prev_time IS NOT NULL
-        )
         SELECT 
-            "__time", post_id, title, author, url, score, num_comments,
-            elapsed_seconds, score_velocity_per_minute, comment_velocity_per_minute
-        FROM velocities
-        ORDER BY score_velocity_per_minute DESC
-        LIMIT 3
+            "__time",
+            post_id,
+            title,
+            author,
+            url,
+            score,
+            num_comments,
+            dt_sec,
+            v_score AS score_velocity_per_minute,
+            v_comment AS comment_velocity_per_minute
+        FROM "hn_snapshots"
+        WHERE latest_flag = 1
+          AND eligible = 1
+          AND v_score IS NOT NULL
+        GROUP BY "__time", post_id, title, author, url, score, num_comments, dt_sec, v_score, v_comment
+        ORDER BY v_score DESC
+        LIMIT 5
         """
     ),
     (
-        "Query 2: Velocity Acceleration & Spurt Detection",
+        "Query 2: Velocity Acceleration & Narrative Spurt Detection",
         """
-        WITH snapshot_lags AS (
-            SELECT
-                post_id, title, author,
-                CASE 
-                    WHEN url IS NOT NULL AND url != '' THEN url
-                    ELSE CONCAT('https://news.ycombinator.com/item?id=', post_id)
-                END AS url,
-                "__time", score, num_comments,
-                LAG("__time", 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_time,
-                LAG(score, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_score,
-                LAG(num_comments, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_comments
-            FROM "hn_snapshots"
-        ),
-        velocities AS (
-            SELECT
-                post_id, title, author, url, "__time", score, num_comments,
-                (score - prev_score) AS score_delta,
-                (num_comments - prev_comments) AS comment_delta,
-                TIMESTAMPDIFF(SECOND, prev_time, "__time") AS elapsed_seconds,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN ROUND(CAST(score - prev_score AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0), 4)
-                    ELSE 0.0
-                END AS score_velocity_per_minute,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN ROUND(CAST(num_comments - prev_comments AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0), 4)
-                    ELSE 0.0
-                END AS comment_velocity_per_minute
-            FROM snapshot_lags
-            WHERE prev_time IS NOT NULL
-        ),
-        accelerations AS (
-            SELECT
-                post_id, title, author, url, "__time", score, num_comments, elapsed_seconds,
-                score_velocity_per_minute, comment_velocity_per_minute,
-                LAG(score_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_score_velocity,
-                LAG(comment_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_comment_velocity,
-                CASE
-                    WHEN elapsed_seconds > 0 AND LAG(score_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time") IS NOT NULL
-                    THEN ROUND(
-                        (score_velocity_per_minute - LAG(score_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time"))
-                        / (CAST(elapsed_seconds AS DOUBLE) / 60.0),
-                        6
-                    )
-                    ELSE 0.0
-                END AS score_acceleration,
-                CASE
-                    WHEN elapsed_seconds > 0 AND LAG(comment_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time") IS NOT NULL
-                    THEN ROUND(
-                        (comment_velocity_per_minute - LAG(comment_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time"))
-                        / (CAST(elapsed_seconds AS DOUBLE) / 60.0),
-                        6
-                    )
-                    ELSE 0.0
-                END AS comment_acceleration
-            FROM velocities
-        )
         SELECT 
-            "__time", post_id, title, author, url, score, num_comments, elapsed_seconds,
-            score_velocity_per_minute, comment_velocity_per_minute,
-            score_acceleration, comment_acceleration
-        FROM accelerations
-        WHERE prev_score_velocity IS NOT NULL
-        ORDER BY score_acceleration DESC
-        LIMIT 3
+            "__time",
+            post_id,
+            title,
+            author,
+            url,
+            score,
+            num_comments,
+            dt_sec,
+            v_score AS score_velocity_per_minute,
+            v_comment AS comment_velocity_per_minute,
+            a_score AS score_acceleration,
+            a_comment AS comment_acceleration,
+            a_norm
+        FROM "hn_snapshots"
+        WHERE a_score IS NOT NULL
+        GROUP BY "__time", post_id, title, author, url, score, num_comments, dt_sec, v_score, v_comment, a_score, a_comment, a_norm
+        ORDER BY a_norm DESC
+        LIMIT 5
         """
     ),
     (
         "Query 3: Real-Time Narrative Leaderboard",
         """
-        WITH snapshot_lags AS (
-            SELECT
-                post_id, title, author,
-                CASE 
-                    WHEN url IS NOT NULL AND url != '' THEN url
-                    ELSE CONCAT('https://news.ycombinator.com/item?id=', post_id)
-                END AS url,
-                "__time", score, num_comments,
-                LAG("__time", 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_time,
-                LAG(score, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_score,
-                LAG(num_comments, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_comments
-            FROM "hn_snapshots"
-        ),
-        velocities AS (
-            SELECT
-                post_id, title, author, url, "__time", score, num_comments,
-                TIMESTAMPDIFF(SECOND, prev_time, "__time") AS elapsed_seconds,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN ROUND(CAST(score - prev_score AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0), 4)
-                    ELSE 0.0
-                END AS score_velocity_per_minute,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN ROUND(CAST(num_comments - prev_comments AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0), 4)
-                    ELSE 0.0
-                END AS comment_velocity_per_minute
-            FROM snapshot_lags
-            WHERE prev_time IS NOT NULL
-        ),
-        accelerations AS (
-            SELECT
-                post_id, title, author, url, "__time", score, num_comments, elapsed_seconds,
-                score_velocity_per_minute, comment_velocity_per_minute,
-                CASE
-                    WHEN elapsed_seconds > 0 AND LAG(score_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time") IS NOT NULL
-                    THEN ROUND(
-                        (score_velocity_per_minute - LAG(score_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time"))
-                        / (CAST(elapsed_seconds AS DOUBLE) / 60.0),
-                        6
-                    )
-                    ELSE 0.0
-                END AS score_acceleration,
-                CASE
-                    WHEN elapsed_seconds > 0 AND LAG(comment_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time") IS NOT NULL
-                    THEN ROUND(
-                        (comment_velocity_per_minute - LAG(comment_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time"))
-                        / (CAST(elapsed_seconds AS DOUBLE) / 60.0),
-                        6
-                    )
-                    ELSE 0.0
-                END AS comment_acceleration,
-                ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY "__time" DESC) AS recency_rank
-            FROM velocities
-        )
         SELECT
-            post_id, title, author, url, score AS current_score, num_comments AS current_comments,
-            score_velocity_per_minute, comment_velocity_per_minute,
-            score_acceleration, comment_acceleration,
+            post_id,
+            title,
+            author,
+            score AS current_score,
+            num_comments AS current_comments,
+            v_score AS score_velocity_per_minute,
+            v_comment AS comment_velocity_per_minute,
+            a_score AS score_acceleration,
+            a_comment AS comment_acceleration,
+            rank_score AS weighted_velocity_rank,
             "__time" AS last_observation_time
-        FROM accelerations
-        WHERE recency_rank = 1
-        ORDER BY score_velocity_per_minute DESC, score_acceleration DESC
-        LIMIT 3
+        FROM "hn_snapshots"
+        WHERE eligible = 1
+          AND latest_flag = 1
+          AND v_score IS NOT NULL
+        GROUP BY post_id, title, author, score, num_comments, v_score, v_comment, a_score, a_comment, rank_score, "__time"
+        ORDER BY rank_score DESC
+        LIMIT 5
         """
     ),
     (
-        "Query 4: Macro Narrative Velocity Time-Series",
+        "Query 4: Aggregate Engagement Velocity Trend (5-Min)",
         """
-        WITH snapshot_lags AS (
-            SELECT
-                post_id, author, "__time", score, num_comments,
-                LAG("__time", 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_time,
-                LAG(score, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_score,
-                LAG(num_comments, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_comments
-            FROM "hn_snapshots"
-        ),
-        velocities AS (
-            SELECT
-                post_id, author, "__time",
-                TIMESTAMPDIFF(SECOND, prev_time, "__time") AS elapsed_seconds,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN CAST(score - prev_score AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0)
-                    ELSE 0.0
-                END AS score_velocity_per_minute,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN CAST(num_comments - prev_comments AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0)
-                    ELSE 0.0
-                END AS comment_velocity_per_minute
-            FROM snapshot_lags
-            WHERE prev_time IS NOT NULL
-        )
         SELECT
             TIME_FLOOR("__time", 'PT5M') AS bucket_time,
             COUNT(*) AS total_snapshot_observations,
             COUNT(DISTINCT post_id) AS active_tracked_stories,
             COUNT(DISTINCT author) AS active_authors,
-            ROUND(AVG(score_velocity_per_minute), 4) AS avg_score_velocity,
-            ROUND(MAX(score_velocity_per_minute), 4) AS peak_score_velocity,
-            ROUND(AVG(comment_velocity_per_minute), 4) AS avg_comment_velocity,
-            ROUND(MAX(comment_velocity_per_minute), 4) AS peak_comment_velocity
-        FROM velocities
+            ROUND(AVG(v_score), 4) AS avg_score_velocity,
+            ROUND(MAX(v_score), 4) AS peak_score_velocity,
+            ROUND(AVG(v_comment), 4) AS avg_comment_velocity,
+            ROUND(MAX(v_comment), 4) AS peak_comment_velocity
+        FROM "hn_snapshots"
+        WHERE v_score IS NOT NULL
         GROUP BY TIME_FLOOR("__time", 'PT5M')
         ORDER BY bucket_time DESC
-        LIMIT 3
+        LIMIT 5
         """
     ),
     (
-        "Query 5: Top Accelerating Breakout Stories",
+        "Query 5: Top Accelerating 'Breakout' Stories",
         """
-        WITH snapshot_lags AS (
-            SELECT
-                post_id, title, author,
-                CASE 
-                    WHEN url IS NOT NULL AND url != '' THEN url
-                    ELSE CONCAT('https://news.ycombinator.com/item?id=', post_id)
-                END AS url,
-                "__time", score, num_comments,
-                LAG("__time", 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_time,
-                LAG(score, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_score,
-                LAG(num_comments, 1) OVER (PARTITION BY post_id ORDER BY "__time") AS prev_comments
-            FROM "hn_snapshots"
-        ),
-        velocities AS (
-            SELECT
-                post_id, title, author, url, "__time", score, num_comments,
-                TIMESTAMPDIFF(SECOND, prev_time, "__time") AS elapsed_seconds,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN CAST(score - prev_score AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0)
-                    ELSE 0.0
-                END AS score_velocity_per_minute,
-                CASE 
-                    WHEN prev_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, prev_time, "__time") > 0 
-                    THEN CAST(num_comments - prev_comments AS DOUBLE) / (CAST(TIMESTAMPDIFF(SECOND, prev_time, "__time") AS DOUBLE) / 60.0)
-                    ELSE 0.0
-                END AS comment_velocity_per_minute
-            FROM snapshot_lags
-            WHERE prev_time IS NOT NULL
-        ),
-        accelerations AS (
-            SELECT
-                post_id, title, author, url, "__time", score, num_comments, elapsed_seconds,
-                score_velocity_per_minute, comment_velocity_per_minute,
-                CASE
-                    WHEN elapsed_seconds > 0 AND LAG(score_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time") IS NOT NULL
-                    THEN ROUND(
-                        (score_velocity_per_minute - LAG(score_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time"))
-                        / (CAST(elapsed_seconds AS DOUBLE) / 60.0),
-                        6
-                    )
-                    ELSE 0.0
-                END AS score_acceleration,
-                CASE
-                    WHEN elapsed_seconds > 0 AND LAG(comment_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time") IS NOT NULL
-                    THEN ROUND(
-                        (comment_velocity_per_minute - LAG(comment_velocity_per_minute, 1) OVER (PARTITION BY post_id ORDER BY "__time"))
-                        / (CAST(elapsed_seconds AS DOUBLE) / 60.0),
-                        6
-                    )
-                    ELSE 0.0
-                END AS comment_acceleration,
-                ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY "__time" DESC) AS recency_rank
-            FROM velocities
-        )
         SELECT
-            post_id, title, author, url, score, num_comments,
-            ROUND(score_velocity_per_minute, 4) AS score_velocity_per_minute,
-            ROUND(score_acceleration, 6) AS score_acceleration,
-            ROUND(comment_acceleration, 6) AS comment_acceleration,
+            post_id,
+            title,
+            author,
+            score AS current_score,
+            num_comments AS current_comments,
+            v_score AS score_velocity_per_minute,
+            a_score AS score_acceleration,
+            a_norm,
+            a_comment AS comment_acceleration,
             "__time" AS detected_at
-        FROM accelerations
-        WHERE recency_rank = 1 
-          AND score_acceleration > 0.0
-        ORDER BY score_acceleration DESC
-        LIMIT 3
+        FROM "hn_snapshots"
+        WHERE eligible = 1
+          AND latest_flag = 1
+          AND a_score > 0
+        GROUP BY post_id, title, author, score, num_comments, v_score, a_score, a_norm, a_comment, "__time"
+        ORDER BY a_norm DESC
+        LIMIT 5
+        """
+    ),
+    (
+        "Query 6: KPI Executive Summary Cards",
+        """
+        SELECT
+            COUNT(DISTINCT post_id) AS active_stories,
+            ROUND(AVG(CASE WHEN v_score IS NOT NULL THEN v_score END), 2) AS avg_score_velocity,
+            ROUND(MAX(v_score), 2) AS highest_score_velocity,
+            COALESCE(ROUND(MAX(CASE WHEN a_score > 0 THEN a_score END), 4), 0.0) AS highest_score_acceleration
+        FROM "hn_snapshots"
+        WHERE latest_flag = 1
+          AND eligible = 1
         """
     )
 ]
@@ -326,7 +150,8 @@ def run_tests():
                 data = res.json()
                 print(f"=== {name} ===")
                 print(f"Status: PASSED ({len(data)} rows returned)")
-                print(json.dumps(data, indent=2))
+                if data:
+                    print(json.dumps(data[0], indent=2))
                 print()
             else:
                 print(f"[FAILED] {name} (HTTP {res.status_code}): {res.text}")

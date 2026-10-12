@@ -15,7 +15,47 @@
           "subreddit",
           "title",
           "url",
-          "created_at"
+          "created_at",
+          {
+            "type": "double",
+            "name": "dt_sec"
+          },
+          {
+            "type": "double",
+            "name": "v_score"
+          },
+          {
+            "type": "double",
+            "name": "v_comment"
+          },
+          {
+            "type": "double",
+            "name": "a_score"
+          },
+          {
+            "type": "double",
+            "name": "a_comment"
+          },
+          {
+            "type": "double",
+            "name": "a_norm"
+          },
+          {
+            "type": "double",
+            "name": "rank_score"
+          },
+          {
+            "type": "long",
+            "name": "eligible"
+          },
+          {
+            "type": "long",
+            "name": "latest_flag"
+          },
+          {
+            "type": "long",
+            "name": "is_capped"
+          }
         ]
       },
       "metricsSpec": [

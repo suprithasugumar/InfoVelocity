@@ -19,6 +19,7 @@ import subprocess
 import requests
 import json
 
+INDEXER_URL = os.getenv("DRUID_OVERLORD_URL", "http://localhost:8081")
 ROUTER_URL = os.getenv("DRUID_ROUTER_URL", "http://localhost:8888")
 CONTAINER_NAME = "middlemanager"
 
@@ -51,7 +52,7 @@ def submit_task(spec_file: str):
         spec = json.load(f)
 
     datasource = spec.get("spec", {}).get("dataSchema", {}).get("dataSource", "hn_events")
-    task_url = f"{ROUTER_URL}/druid/indexer/v1/task"
+    task_url = f"{INDEXER_URL}/druid/indexer/v1/task"
     print(f"[*] Submitting ingestion task for datasource '{datasource}' to {task_url}...")
 
     resp = requests.post(task_url, json=spec)
@@ -116,8 +117,21 @@ def main():
         spec_file = "druid_ingestion_spec.json"
         target_path = "/opt/shared/hn_events.jsonl"
 
+    if args.snapshots or (data_file and "snapshots" in data_file):
+        try:
+            from compute_kinematics import compute_file_kinematics
+            print(f"[*] Pre-computing kinematics for {data_file}...")
+            compute_file_kinematics(data_file)
+        except Exception as e:
+            print(f"[WARN] Failed to pre-compute kinematics: {e}")
+
     copy_data_to_container(data_file, target_path)
     submit_task(spec_file)
+
+    print("\n" + "=" * 80)
+    print("  INFOVELOCITY WEB DASHBOARD:")
+    print("  URL: http://localhost:8088/superset/dashboard/infovelocity-narrative-tracker/")
+    print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":

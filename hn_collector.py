@@ -28,6 +28,7 @@ from pathlib import Path
 from collections import OrderedDict
 import requests
 from dotenv import load_dotenv
+from compute_kinematics import StoryKinematicsTracker, compute_file_kinematics
 
 # Load environment variables
 load_dotenv()
@@ -103,18 +104,27 @@ def load_seen_ids_and_active_pool(events_file: str, active_window_hours: int = 1
 
 
 def fetch_new_story_ids(limit: int = 25, timeout: int = 10) -> list:
-    """Fetches latest story IDs from Hacker News /v0/newstories.json endpoint."""
-    url = f"{HN_BASE_URL}/newstories.json"
+    """Fetches active trending and latest story IDs from Hacker News API."""
+    story_ids = []
+    # 1. Fetch top/trending stories with active upvotes & comments
     try:
-        response = requests.get(url, timeout=timeout)
-        response.raise_for_status()
-        story_ids = response.json()
-        if isinstance(story_ids, list):
-            return story_ids[:limit]
-        return []
+        r_top = requests.get(f"{HN_BASE_URL}/topstories.json", timeout=timeout)
+        if r_top.ok and isinstance(r_top.json(), list):
+            story_ids.extend(r_top.json()[:limit])
     except Exception as e:
-        logger.error(f"Failed to fetch new stories from Hacker News API: {e}")
-        return []
+        logger.warning(f"Failed to fetch top stories: {e}")
+
+    # 2. Also fetch newest stories
+    try:
+        r_new = requests.get(f"{HN_BASE_URL}/newstories.json", timeout=timeout)
+        if r_new.ok and isinstance(r_new.json(), list):
+            for pid in r_new.json()[:limit]:
+                if pid not in story_ids:
+                    story_ids.append(pid)
+    except Exception as e:
+        logger.warning(f"Failed to fetch new stories: {e}")
+
+    return story_ids[:limit]
 
 
 def fetch_item_details(item_id: str | int, timeout: int = 10) -> dict | None:
@@ -154,6 +164,20 @@ def prune_active_pool(active_pool: OrderedDict, active_window_hours: int = 12, a
     return len(expired_ids)
 
 
+def is_valid_story(item_data: dict | None) -> bool:
+    """Only keep items where type == 'story', not deleted, not dead, and title is non-empty."""
+    if not item_data or not isinstance(item_data, dict):
+        return False
+    if item_data.get("deleted") or item_data.get("dead"):
+        return False
+    if item_data.get("type") != "story":
+        return False
+    title = item_data.get("title")
+    if not title or not str(title).strip():
+        return False
+    return True
+
+
 def poll_cycle_live(
     events_file: str,
     snapshots_file: str,
@@ -161,7 +185,8 @@ def poll_cycle_live(
     active_pool: OrderedDict,
     posts_per_poll: int = 25,
     active_window_hours: int = 12,
-    active_limit: int = 100
+    active_limit: int = 100,
+    kinematics_tracker: StoryKinematicsTracker = None
 ) -> tuple[int, int]:
     """
     Executes a dual-phase polling cycle:
@@ -180,10 +205,12 @@ def poll_cycle_live(
     for item_id in candidate_ids:
         str_id = str(item_id)
         if str_id in seen_ids:
+            if str_id not in active_pool:
+                active_pool[str_id] = now_epoch
             continue
 
         item_data = fetch_item_details(item_id)
-        if not item_data or item_data.get("deleted") or not item_data.get("id"):
+        if not is_valid_story(item_data):
             seen_ids.add(str_id)
             continue
 
@@ -196,7 +223,7 @@ def poll_cycle_live(
             "post_id": str_id,
             "timestamp": created_iso,
             "created_at": created_iso,
-            "title": str(item_data.get("title") or ""),
+            "title": str(item_data.get("title") or "").strip(),
             "body": str(item_data.get("text") or ""),
             "author": str(item_data.get("by") or "[deleted]"),
             "source": "hackernews",
@@ -231,7 +258,9 @@ def poll_cycle_live(
     snapshots = []
     for str_id in list(active_pool.keys()):
         item_data = fetch_item_details(str_id)
-        if not item_data or item_data.get("deleted"):
+        if not is_valid_story(item_data):
+            if str_id in active_pool:
+                del active_pool[str_id]
             continue
 
         created_epoch = item_data.get("time") or active_pool.get(str_id, now_epoch)
@@ -242,7 +271,7 @@ def poll_cycle_live(
             "post_id": str_id,
             "timestamp": current_snapshot_ts,  # Current observation timestamp
             "created_at": created_iso,         # Original publication timestamp
-            "title": str(item_data.get("title") or ""),
+            "title": str(item_data.get("title") or "").strip(),
             "author": str(item_data.get("by") or "[deleted]"),
             "source": "hackernews",
             "subreddit": "hackernews",
@@ -250,6 +279,8 @@ def poll_cycle_live(
             "score": int(item_data.get("score") or 0),
             "num_comments": int(item_data.get("descendants") or 0)
         }
+        if kinematics_tracker:
+            kinematics_tracker.process_snapshot(snapshot_record)
         snapshots.append(snapshot_record)
 
     if snapshots:
@@ -258,117 +289,11 @@ def poll_cycle_live(
                 for snap in snapshots:
                     f.write(json.dumps(snap, ensure_ascii=False) + "\n")
             logger.info(f"[Snapshot] Saved {len(snapshots)} engagement snapshots to {snapshots_file} (ts={current_snapshot_ts}).")
+            # Ensure file-level kinematics and latest_flags are computed
+            compute_file_kinematics(snapshots_file, poll_interval=kinematics_tracker.poll_interval if kinematics_tracker else 300)
         except IOError as e:
             logger.error(f"Failed to write to {snapshots_file}: {e}")
 
-    return len(new_catalog_events), len(snapshots)
-
-
-# In-memory mock store for demo simulation across cycles
-_DEMO_STORY_STORE = {}
-
-
-def poll_cycle_demo(
-    events_file: str,
-    snapshots_file: str,
-    seen_ids: set,
-    active_pool: OrderedDict,
-    active_window_hours: int = 12,
-    active_limit: int = 100
-) -> tuple[int, int]:
-    """Generates simulated stories and multi-timestamp snapshots with growing scores/comments."""
-    import random
-
-    now_dt = datetime.now(timezone.utc)
-    current_snapshot_ts = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    now_epoch = now_dt.timestamp()
-
-    sample_templates = [
-        ("Show HN: Fast local vector search in pure C", "https://github.com/example/fast-vector-c", "c_optimizer"),
-        ("Ask HN: What are your favorite lightweight monitoring stacks?", None, "devops_builder"),
-        ("PostgreSQL 18 query planner optimizations and index skipping", "https://example-blog.org/postgres-18-planner", "db_enthusiast"),
-        ("Why we migrated our data pipeline from batch to streaming Druid", "https://tech-insights.io/streaming-druid-pipeline", "data_lead"),
-        ("A deep dive into modern browser layout engines", "https://web-internals.dev/layout-engine-deep-dive", "frontend_nerd")
-    ]
-
-    # Discovery: create 2-3 new stories per cycle in demo
-    new_catalog_events = []
-    num_new = 3
-    for _ in range(num_new):
-        item_id = str(random.randint(49780000, 49789999))
-        if item_id in seen_ids:
-            continue
-
-        title, url, author = random.choice(sample_templates)
-        initial_score = random.randint(1, 5)
-        initial_comments = random.randint(0, 2)
-        created_iso = current_snapshot_ts
-
-        _DEMO_STORY_STORE[item_id] = {
-            "title": title,
-            "url": url if url else f"https://news.ycombinator.com/item?id={item_id}",
-            "author": author,
-            "created_iso": created_iso,
-            "created_epoch": now_epoch,
-            "score": initial_score,
-            "num_comments": initial_comments
-        }
-
-        catalog_record = {
-            "post_id": item_id,
-            "timestamp": created_iso,
-            "created_at": created_iso,
-            "title": title,
-            "body": "Demo story body text.",
-            "author": author,
-            "source": "hackernews",
-            "subreddit": "hackernews",
-            "url": _DEMO_STORY_STORE[item_id]["url"],
-            "score": initial_score,
-            "num_comments": initial_comments
-        }
-        new_catalog_events.append(catalog_record)
-        seen_ids.add(item_id)
-        active_pool[item_id] = now_epoch
-
-    if new_catalog_events:
-        with open(events_file, "a", encoding="utf-8") as f:
-            for ev in new_catalog_events:
-                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-
-    # Prune active pool
-    prune_active_pool(active_pool, active_window_hours, active_limit)
-
-    # Snapshot generation: increment score and comments for all active stories
-    snapshots = []
-    for str_id in list(active_pool.keys()):
-        story = _DEMO_STORY_STORE.get(str_id)
-        if not story:
-            continue
-
-        # Simulate engagement growth over time
-        story["score"] += random.randint(2, 15)
-        story["num_comments"] += random.randint(0, 4)
-
-        snapshot_record = {
-            "post_id": str_id,
-            "timestamp": current_snapshot_ts,  # Current snapshot timestamp
-            "created_at": story["created_iso"],
-            "title": story["title"],
-            "author": story["author"],
-            "source": "hackernews",
-            "subreddit": "hackernews",
-            "url": story["url"],
-            "score": story["score"],
-            "num_comments": story["num_comments"]
-        }
-        snapshots.append(snapshot_record)
-
-    with open(snapshots_file, "a", encoding="utf-8") as f:
-        for snap in snapshots:
-            f.write(json.dumps(snap, ensure_ascii=False) + "\n")
-
-    logger.info(f"[DEMO MODE] Appended {len(new_catalog_events)} new stories to {events_file} and {len(snapshots)} snapshots to {snapshots_file}.")
     return len(new_catalog_events), len(snapshots)
 
 
@@ -419,12 +344,6 @@ def main():
         default=0,
         help="Number of polling cycles to run (0 = run continuously)."
     )
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Run in demo mode generating sample stories and multi-snapshot engagement curves."
-    )
-
     args = parser.parse_args()
 
     logger.info("=================================================================")
@@ -438,7 +357,7 @@ def main():
     logger.info(f"Active Story Limit   : {args.active_limit}")
     logger.info(f"Active Window Hours  : {args.active_window_hours} hours")
     logger.info(f"Cycles Target        : {'Continuous' if args.cycles == 0 else args.cycles}")
-    logger.info(f"Mode                 : {'Demo (Simulated)' if args.demo else 'Live Hacker News API'}")
+    logger.info("Mode                 : Live Hacker News API")
 
     # Seed seen IDs and active story pool from existing events catalog
     seen_ids, active_pool = load_seen_ids_and_active_pool(
@@ -446,6 +365,10 @@ def main():
         active_window_hours=args.active_window_hours,
         active_limit=args.active_limit
     )
+
+    # Initialize kinematics tracker and seed from existing snapshots
+    kinematics_tracker = StoryKinematicsTracker(poll_interval=args.interval)
+    kinematics_tracker.seed_from_file(args.snapshots_output)
 
     cycle_count = 0
     total_new_events = 0
@@ -456,25 +379,16 @@ def main():
             cycle_count += 1
             logger.info(f"--- Starting Polling Cycle {cycle_count} ---")
 
-            if args.demo:
-                new_ev, new_snap = poll_cycle_demo(
-                    args.output,
-                    args.snapshots_output,
-                    seen_ids,
-                    active_pool,
-                    active_window_hours=args.active_window_hours,
-                    active_limit=args.active_limit
-                )
-            else:
-                new_ev, new_snap = poll_cycle_live(
-                    args.output,
-                    args.snapshots_output,
-                    seen_ids,
-                    active_pool,
-                    posts_per_poll=args.limit,
-                    active_window_hours=args.active_window_hours,
-                    active_limit=args.active_limit
-                )
+            new_ev, new_snap = poll_cycle_live(
+                args.output,
+                args.snapshots_output,
+                seen_ids,
+                active_pool,
+                posts_per_poll=args.limit,
+                active_window_hours=args.active_window_hours,
+                active_limit=args.active_limit,
+                kinematics_tracker=kinematics_tracker
+            )
 
             total_new_events += new_ev
             total_snapshots += new_snap

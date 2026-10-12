@@ -254,53 +254,129 @@ InfoVelocity/
 
 ---
 
-## Quickstart Guide
+## Quickstart Guide & How to Run
 
 ### 1. Prerequisites
-- Python 3.10+
-- Docker & Docker Compose (for Apache Druid & Apache Superset containers)
+- Python 3.10+ (tested on Python 3.11)
+- Docker & Docker Compose (optional, for Apache Druid & Apache Superset containers)
 - No API keys required (Hacker News endpoints are public)
 
-### 2. Environment Setup
+### 2. Environment Setup & Activation
+
+First, clone the repository, set up the virtual environment, and install dependencies:
+
 ```bash
 # Clone repository and enter directory
 cd InfoVelocity
 
-# Create and activate virtual environment
+# Create virtual environment (if not already created)
 python -m venv venv
-.\venv\Scripts\Activate.ps1    # On Windows PowerShell
-# source venv/bin/activate     # On Linux/macOS
 
-# Install dependencies
+# Activate virtual environment
+# Windows (PowerShell):
+.\venv\Scripts\Activate.ps1
+# Windows (Command Prompt):
+.\venv\Scripts\activate.bat
+# Linux / macOS (Bash/Zsh):
+source venv/bin/activate
+
+# Install required dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Run Data Collection
+---
+
+### 3. Step-by-Step Execution Commands
+
+#### Option A: Instant Mathematical Demo & Kinematics Showcase (Recommended First Step)
+Runs completely offline with zero configuration and prints out the verified first and second derivative momentum table in seconds:
 ```bash
-# Run continuous live collector (polls every 300s, tracking up to 100 stories)
+python demo_data_generator.py
+```
+*Outputs: Generates `demo_hn_events.jsonl`, `demo_hn_snapshots.jsonl`, `druid_demo_snapshots_ingestion_spec.json`, and terminal verification tables.*
+
+---
+
+#### Option B: Live Hacker News Data Collection & Snapshotting
+Fetches real-time submissions from the Hacker News Firebase REST API:
+
+```bash
+# 1. Quick test run: 1 cycle, fetch top 5 stories (exits immediately after completion)
+python hn_collector.py --cycles 1 --limit 5
+
+# 2. Continuous real-time collector (default: polls every 300s, tracks up to 100 stories):
 python hn_collector.py
 
-# Run for a fixed number of cycles (e.g. 5 cycles for testing)
-python hn_collector.py --cycles 5
-
-# Run in offline simulation / demo mode
-python hn_collector.py --demo --cycles 3
+# 3. Fast offline simulation mode (e.g., 3 cycles with a 2-second interval):
+python hn_collector.py --demo --cycles 3 --interval 2
 ```
+*Outputs: Writes immutable first-seen stories to `hn_events.jsonl` and time-series observations to `hn_snapshots.jsonl`.*
 
-### 4. Ingest into Apache Druid
+---
+
+#### Option C: Kinematics Processing (Instantaneous Velocity & Acceleration)
+Processes snapshot observations in Python to compute 1st derivative ($v_{\text{score}}, v_{\text{comment}}$) and 2nd derivative ($a_{\text{score}}, a_{\text{comment}}$):
 ```bash
-# Submit snapshot batch ingestion task
+python compute_kinematics.py --input hn_snapshots.jsonl
+```
+*Outputs: Enriches `hn_snapshots.jsonl` with kinematic delta columns (`dt_sec`, `v_score`, `v_comment`, `a_score`, `a_comment`, `a_norm`, `rank_score`, `eligible`).*
+
+---
+
+#### Option D: Apache Druid Batch Ingestion (OLAP Store)
+*Requires Apache Druid running on `http://localhost:8888`:*
+
+```bash
+# Ingest live time-series snapshots
 python submit_ingestion.py --snapshots
+
+# Or ingest the deterministic demo dataset into an isolated test datasource
+python submit_ingestion.py --data demo_hn_snapshots.jsonl --spec druid_demo_snapshots_ingestion_spec.json
 ```
 
-### 5. Validate SQL & Superset Dashboards
+---
+
+#### Option E: Query Validation & Superset Dashboard Automation
+*Requires Apache Druid and Apache Superset running:*
+
 ```bash
-# Test Druid SQL calculations (Queries 1-5)
+# Run all 5 analytical SQL queries against Druid (Instantaneous velocity, acceleration, breakouts)
 python test_queries.py
 
-# Validate Superset dashboard slices
+# Provision or validate Apache Superset charts, datasets, and dashboard
 python test_superset_dashboard.py
 ```
+
+---
+
+#### Option F: Accessing the Web Dashboard & Website
+Once the containers are running, access the web frontends in your browser:
+
+1. **InfoVelocity Real-Time Superset Dashboard** (Main Website):
+   - **URL**: [http://localhost:8088/superset/dashboard/infovelocity-narrative-tracker/](http://localhost:8088/superset/dashboard/infovelocity-narrative-tracker/)
+   - **Default Login**: `admin` / `admin`
+   - **Command to open in browser**:
+     ```powershell
+     # Windows (PowerShell)
+     Start-Process "http://localhost:8088/superset/dashboard/infovelocity-narrative-tracker/"
+
+     # Windows (Command Prompt)
+     start http://localhost:8088/superset/dashboard/infovelocity-narrative-tracker/
+
+     # Linux
+     xdg-open "http://localhost:8088/superset/dashboard/infovelocity-narrative-tracker/"
+
+     # macOS
+     open "http://localhost:8088/superset/dashboard/infovelocity-narrative-tracker/"
+     ```
+
+2. **Apache Druid Web Console** (OLAP & SQL Query Interface):
+   - **URL**: [http://localhost:8888](http://localhost:8888)
+   - **Command to open in browser**:
+     ```powershell
+     Start-Process "http://localhost:8888"   # Windows PowerShell
+     start http://localhost:8888             # Windows CMD
+     ```
 
 ---
 
@@ -313,19 +389,25 @@ For academic presentations, project evaluations, and offline demonstrations, liv
 - **Offline & Safe**: Completely decoupled from the live Hacker News API (`demo_hn_events.jsonl` and `demo_hn_snapshots.jsonl` do not touch production files).
 - **Instantaneous Presentation Verification**: Displays calculated velocity and acceleration tables directly in the terminal and provides a dedicated Druid test spec (`druid_demo_snapshots_ingestion_spec.json`).
 
-### 1. Generate Synthetic Demo Data
-```bash
+### 1. One-Command Live Visual Demo (Druid & Superset)
+To immediately populate the Superset dashboard and Druid OLAP store with **only** the 5 fixed demo stories anchored to the current timestamp:
+```powershell
+python demo_data_generator.py --now --load-to-druid
+```
+*What this single command does:*
+1. Generates the 5 deterministic story trajectories ending at the current time (`t5 = now`).
+2. Computes the kinematic derivatives ($v_{\text{score}}, v_{\text{comment}}, a_{\text{score}}, a_{\text{comment}}, \text{rank\_score}$).
+3. Clears old Druid segments and ingests the demo snapshots into `hn_snapshots`.
+4. The Superset dashboard immediately displays the 5 fixed stories without any background noise!
+
+---
+
+### 2. Pure Terminal Demo (Offline Mathematical Verification)
+If you just want to verify the mathematical kinematics table in your console without Docker:
+```powershell
 python demo_data_generator.py
 ```
-This writes:
-- `demo_hn_events.jsonl` (5 distinct story catalog records)
-- `demo_hn_snapshots.jsonl` (30 sequential time-series snapshot observations)
-- `druid_demo_snapshots_ingestion_spec.json` (Isolated Druid ingestion spec)
-
-### 2. Ingest into Isolated Test Datasource
-```bash
-python submit_ingestion.py --data demo_hn_snapshots.jsonl --spec druid_demo_snapshots_ingestion_spec.json
-```
+This generates `demo_hn_events.jsonl`, `demo_hn_snapshots.jsonl`, and prints out the derivative calculus verification table.
 
 ### 3. Demonstrating Velocity & Acceleration Dynamics
 
@@ -350,3 +432,6 @@ python submit_ingestion.py --data demo_hn_snapshots.jsonl --spec druid_demo_snap
 - **Streaming Ingestion**: Transition from batch snapshot files to an event streaming broker for sub-second ingestion latency.
 - **Cross-Platform Adapters**: Add modular ingestion connectors for open discussion platforms (e.g., Bluesky, Mastodon, Lemmy) while preserving the shared velocity calculus.
 - **Automated Webhook Alerts**: Implement webhook notifications triggered when $a_{\text{score}}$ exceeds configurable standard deviation thresholds.
+
+
+

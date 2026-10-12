@@ -313,6 +313,40 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate synthetic reproducible demo data for InfoVelocity.")
     parser.add_argument("--step-minutes", type=int, default=5, help="Step minutes between snapshot intervals")
     parser.add_argument("--output-dir", default=".", help="Output directory for generated files")
+    parser.add_argument("--now", action="store_true", help="Anchor snapshot timestamps to current time (so Superset displays them today)")
+    parser.add_argument("--load-to-druid", action="store_true", help="Automatically compute kinematics and load demo dataset into active Druid 'hn_snapshots' datasource")
     args = parser.parse_args()
 
-    generate_demo_dataset(step_minutes=args.step_minutes, output_dir=args.output_dir)
+    base_time = None
+    if args.now:
+        # 5 intervals back from now so the latest snapshot (t5) is right now
+        base_time = datetime.now(timezone.utc) - timedelta(minutes=5 * args.step_minutes)
+
+    generate_demo_dataset(base_time=base_time, step_minutes=args.step_minutes, output_dir=args.output_dir)
+
+    if args.load_to_druid:
+        import shutil
+        import requests
+        from compute_kinematics import compute_file_kinematics
+        from submit_ingestion import copy_data_to_container, submit_task
+
+        demo_snapshots = str(Path(args.output_dir) / "demo_hn_snapshots.jsonl")
+        active_snapshots = str(Path(args.output_dir) / "hn_snapshots.jsonl")
+
+        print("\n[*] Pre-computing kinematics on demo snapshots...")
+        compute_file_kinematics(demo_snapshots, demo_snapshots)
+
+        print(f"[*] Copying {demo_snapshots} -> {active_snapshots}...")
+        shutil.copyfile(demo_snapshots, active_snapshots)
+
+        print("[*] Clearing old segments in Druid 'hn_snapshots' datasource...")
+        try:
+            requests.delete("http://localhost:8888/druid/coordinator/v1/datasources/hn_snapshots", timeout=5)
+        except Exception as e:
+            print(f"[!] Warning clearing old datasource: {e}")
+
+        print("[*] Ingesting demo dataset into Druid 'hn_snapshots'...")
+        copy_data_to_container(active_snapshots, "/opt/shared/hn_snapshots.jsonl")
+        submit_task("druid_snapshots_ingestion_spec.json")
+        print("\n[SUCCESS] Fixed Demo Dataset is now live in Apache Druid & Apache Superset!")
+        print("-> View Dashboard: http://localhost:8088/superset/dashboard/infovelocity-narrative-tracker/\n")
