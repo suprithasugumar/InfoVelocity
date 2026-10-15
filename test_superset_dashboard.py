@@ -45,11 +45,12 @@ with app.app_context():
     print(f"Dashboard Grid Rows: {grid_children}")
 
     expected_keywords = [
-        "Active Stories",
+        "Active",
         "Avg Velocity",
         "Peak Velocity",
-        "Current Top Accel",
-        "Peak Accel (6h)",
+        "Current Accel",
+        "Peak Accel",
+        "Data Freshness",
         "5-Minute Trend",
         "Momentum Map",
         "Fastest Growing Narratives",

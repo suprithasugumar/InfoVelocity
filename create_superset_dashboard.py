@@ -76,7 +76,10 @@ SELECT
     COUNT(DISTINCT author) AS active_authors,
     ROUND(AVG(v_score), 4) AS avg_score_velocity,
     ROUND(MAX(v_score), 4) AS peak_score_velocity,
-    ROUND(AVG(v_comment), 4) AS avg_comment_velocity,
+    CASE WHEN COUNT(CASE WHEN v_comment > 0 THEN 1 END) > 0 OR SUM(v_comment) > 0
+         THEN ROUND(AVG(v_comment), 4)
+         ELSE NULL
+    END AS avg_comment_velocity,
     ROUND(MAX(v_comment), 4) AS peak_comment_velocity
 FROM "hn_snapshots"
 WHERE "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
@@ -117,7 +120,7 @@ SELECT
     COALESCE(ROUND(a_score, 4), 0.0) AS score_acceleration,
     COALESCE(ROUND(a_comment, 4), 0.0) AS comment_acceleration,
     COALESCE(ROUND(a_norm, 6), 0.0) AS a_norm,
-    COALESCE(quadrant, 'Fading / Dormant') AS quadrant,
+    COALESCE(quadrant, 'Dormant') AS quadrant,
     COALESCE(story_age, '0m') AS story_age,
     COALESCE(observation_time_ist, '') AS observation_time_ist,
     COALESCE(title_link, title) AS title_link,
@@ -138,6 +141,7 @@ SELECT
 FROM "hn_snapshots"
 WHERE latest_flag = 1
   AND eligible = 1
+  AND "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
 GROUP BY post_id, title, author, score, num_comments, v_score, v_comment, rank_score, a_score, a_comment, a_norm, quadrant, story_age, observation_time_ist, title_link, cluster_id, cluster_label, created_at, url, dt_sec, eligible, latest_flag, is_capped, "__time"
 """.strip()
 
@@ -190,6 +194,7 @@ FROM "hn_snapshots"
 WHERE latest_flag = 1
   AND eligible = 1
   AND a_score > 0
+  AND "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
 GROUP BY post_id, title, author, score, num_comments, v_score, v_comment, a_score, a_norm, a_comment, story_age, observation_time_ist, title_link, cluster_id, cluster_label, created_at, url, dt_sec, eligible, latest_flag, "__time"
 """.strip()
 
@@ -341,15 +346,16 @@ GROUP BY cluster_label, cluster_id
     # -------------------------------------------------------------------------
     kpi_slices = []
 
-    # KPI 1: Active Stories
-    kpi1_name = "Active Stories"
+    # KPI 1: Active
+    kpi1_name = "Active"
+    old_kpi1_names = ["Active Stories"]
     kpi1_params = {
         "datasource": f"{ds_physical.id}__table",
         "viz_type": "big_number",
         "metric": {
             "expressionType": "SQL",
             "sqlExpression": "COUNT(DISTINCT post_id)",
-            "label": "Active Stories"
+            "label": "Active"
         },
         "adhoc_filters": [],
         "granularity_sqla": "__time",
@@ -359,13 +365,15 @@ GROUP BY cluster_label, cluster_id
         "compare_suffix": "vs 30m ago",
         "show_trend_line": True,
         "start_y_axis_at_zero": True,
-        "subheader": "Active distinct threads (last 6h)",
-        "header_font_size": 0.5,
-        "subheader_font_size": 0.15,
+        "subheader": "Stories tracked in last 6h",
+        "header_font_size": 0.55,
+        "subheader_font_size": 0.22,
         "y_axis_format": ",d",
         "color_picker": {"r": 96, "g": 165, "b": 250, "a": 1}
     }
-    kpi1 = db.session.query(Slice).filter_by(slice_name=kpi1_name).first()
+    kpi1 = db.session.query(Slice).filter(
+        Slice.slice_name.in_([kpi1_name] + old_kpi1_names)
+    ).first()
     if not kpi1:
         kpi1 = Slice(
             slice_name=kpi1_name,
@@ -378,6 +386,7 @@ GROUP BY cluster_label, cluster_id
         )
         db.session.add(kpi1)
     else:
+        kpi1.slice_name = kpi1_name
         kpi1.params = json.dumps(kpi1_params)
         kpi1.datasource_id = ds_physical.id
     db.session.flush()
@@ -411,8 +420,8 @@ GROUP BY cluster_label, cluster_id
         "show_trend_line": True,
         "start_y_axis_at_zero": True,
         "subheader": "Mean score velocity (pts/min)",
-        "header_font_size": 0.5,
-        "subheader_font_size": 0.15,
+        "header_font_size": 0.55,
+        "subheader_font_size": 0.22,
         "y_axis_format": ".2f",
         "color_picker": {"r": 96, "g": 165, "b": 250, "a": 1}
     }
@@ -465,8 +474,8 @@ GROUP BY cluster_label, cluster_id
         "show_trend_line": True,
         "start_y_axis_at_zero": True,
         "subheader": "Fastest gaining story (pts/min)",
-        "header_font_size": 0.5,
-        "subheader_font_size": 0.15,
+        "header_font_size": 0.55,
+        "subheader_font_size": 0.22,
         "y_axis_format": ".2f",
         "color_picker": {"r": 96, "g": 165, "b": 250, "a": 1}
     }
@@ -492,16 +501,16 @@ GROUP BY cluster_label, cluster_id
     kpi_slices.append(kpi3)
     print(f"KPI 3 '{kpi3_name}' ready (ID: {kpi3.id})")
 
-    # KPI 4: Current Top Accel
-    kpi4_name = "Current Top Accel"
-    old_kpi4_names = ["Current Top Acceleration"]
+    # KPI 4: Current Accel
+    kpi4_name = "Current Accel"
+    old_kpi4_names = ["Current Top Accel", "Current Top Acceleration"]
     kpi4_params = {
         "datasource": f"{ds_breakout.id}__table",
         "viz_type": "big_number",
         "metric": {
             "expressionType": "SQL",
             "sqlExpression": "COALESCE(ROUND(MAX(score_acceleration), 4), 0.0)",
-            "label": "Top Surge Accel"
+            "label": "Current Accel"
         },
         "adhoc_filters": [
             {
@@ -519,8 +528,8 @@ GROUP BY cluster_label, cluster_id
         "show_trend_line": True,
         "start_y_axis_at_zero": True,
         "subheader": "Latest breakout surge (pts/min²)",
-        "header_font_size": 0.5,
-        "subheader_font_size": 0.15,
+        "header_font_size": 0.55,
+        "subheader_font_size": 0.22,
         "y_axis_format": ".4f",
         "color_picker": {"r": 52, "g": 211, "b": 153, "a": 1}
     }
@@ -546,16 +555,16 @@ GROUP BY cluster_label, cluster_id
     kpi_slices.append(kpi4)
     print(f"KPI 4 '{kpi4_name}' ready (ID: {kpi4.id})")
 
-    # KPI 5: Peak Accel (6h)
-    kpi5_name = "Peak Accel (6h)"
-    old_kpi5_names = ["Peak Acceleration (last 6h)", "Highest Positive Acceleration", "Peak Acceleration"]
+    # KPI 5: Peak Accel
+    kpi5_name = "Peak Accel"
+    old_kpi5_names = ["Peak Accel (6h)", "Peak Acceleration (last 6h)", "Highest Positive Acceleration", "Peak Acceleration"]
     kpi5_params = {
         "datasource": f"{ds_physical.id}__table",
         "viz_type": "big_number",
         "metric": {
             "expressionType": "SQL",
             "sqlExpression": "COALESCE(ROUND(LEAST(MAX(CASE WHEN a_score > 0 THEN a_score END), 50.0), 4), 0.0)",
-            "label": "Peak Accel (6h)"
+            "label": "Peak Accel"
         },
         "adhoc_filters": [],
         "granularity_sqla": "__time",
@@ -565,9 +574,9 @@ GROUP BY cluster_label, cluster_id
         "compare_suffix": "vs 30m ago",
         "show_trend_line": True,
         "start_y_axis_at_zero": True,
-        "subheader": "Max 6h surge rate (Cap 50 pts/min²)",
-        "header_font_size": 0.5,
-        "subheader_font_size": 0.15,
+        "subheader": "Max 6h surge rate (pts/min²)",
+        "header_font_size": 0.55,
+        "subheader_font_size": 0.22,
         "y_axis_format": ".4f",
         "color_picker": {"r": 52, "g": 211, "b": 153, "a": 1}
     }
@@ -593,6 +602,48 @@ GROUP BY cluster_label, cluster_id
     kpi_slices.append(kpi5)
     print(f"KPI 5 '{kpi5_name}' ready (ID: {kpi5.id})")
 
+    # KPI 6: Data Freshness
+    kpi6_name = "Data Freshness"
+    old_kpi6_names = ["Freshness"]
+    kpi6_params = {
+        "datasource": f"{ds_physical.id}__table",
+        "viz_type": "big_number_total",
+        "metric": {
+            "expressionType": "SQL",
+            "sqlExpression": 'ROUND(CAST(TIMESTAMPDIFF(SECOND, MAX("__time"), CURRENT_TIMESTAMP) AS DOUBLE) / 60.0, 1)',
+            "label": "Data Freshness"
+        },
+        "adhoc_filters": [],
+        "granularity_sqla": "__time",
+        "time_range": "No filter",
+        "subheader": "Minutes since last snapshot (warning > 5m)",
+        "header_font_size": 0.55,
+        "subheader_font_size": 0.22,
+        "y_axis_format": ".1f",
+        "color_picker": {"r": 239, "g": 68, "b": 68, "a": 1}
+    }
+    kpi6 = db.session.query(Slice).filter(
+        Slice.slice_name.in_([kpi6_name] + old_kpi6_names)
+    ).first()
+    if not kpi6:
+        kpi6 = Slice(
+            slice_name=kpi6_name,
+            viz_type="big_number_total",
+            datasource_type="table",
+            datasource_id=ds_physical.id,
+            params=json.dumps(kpi6_params),
+            owners=[admin_user],
+            description="Elapsed time in minutes since the last recorded snapshot."
+        )
+        db.session.add(kpi6)
+    else:
+        kpi6.slice_name = kpi6_name
+        kpi6.params = json.dumps(kpi6_params)
+        kpi6.datasource_id = ds_physical.id
+    db.session.flush()
+    kpi_slices.append(kpi6)
+    print(f"KPI 6 '{kpi6_name}' ready (ID: {kpi6.id})")
+
     # -------------------------------------------------------------------------
     # 3. Core Analytical Visualizations (6 Charts)
     # -------------------------------------------------------------------------
@@ -600,7 +651,7 @@ GROUP BY cluster_label, cluster_id
 
     # Chart 1: Engagement Velocity — 5-Minute Trend (echarts_timeseries_line)
     slice1_name = "Engagement Velocity — 5-Minute Trend"
-    old_slice1_names = ["Velocity Trend (5-min Buckets: pts/min & comments/min)", "Engagement Velocity ??? 5-Minute Trend"]
+    old_slice1_names = ["Velocity Trend (5-min Buckets: pts/min & comments/min)", "Engagement Velocity ??? 5-Minute Trend", "Engagement Velocity - 5-Minute Trend"]
     slice1_params = {
         "datasource": f"{ds_macro.id}__table",
         "viz_type": "echarts_timeseries_line",
@@ -626,12 +677,16 @@ GROUP BY cluster_label, cluster_id
         "seriesType": "line",
         "show_legend": True,
         "rich_tooltip": True,
-        "x_axis_title": "Time (UTC)",
+        "show_markers": True,
+        "markerEnabled": True,
+        "markerSize": 6,
+        "connect_nulls": False,
+        "x_axis_title": "Time (UTC) • Last data: 15:30 IST",
         "y_axis_title": "Velocity (pts/min)",
-        "y_axis_title_margin": 35,
-        "x_axis_title_margin": 30,
-        "bottom_margin": "auto",
-        "left_margin": "auto",
+        "y_axis_title_margin": 40,
+        "x_axis_title_margin": 35,
+        "bottom_margin": 45,
+        "left_margin": 45,
         "color_scheme": "supersetColors"
     }
     s1 = db.session.query(Slice).filter(
@@ -675,7 +730,7 @@ GROUP BY cluster_label, cluster_id
         },
         "size": {
             "expressionType": "SQL",
-            "sqlExpression": "ROUND(SQRT(GREATEST(MAX(current_score), 1)), 2)",
+            "sqlExpression": "CASE WHEN AVG(score_velocity_per_minute) = 0 AND AVG(score_acceleration) = 0 THEN 1.0 ELSE ROUND(SQRT(GREATEST(MAX(current_score), 1)), 2) END",
             "label": "Sqrt(Score)"
         },
         "adhoc_filters": [
@@ -687,15 +742,27 @@ GROUP BY cluster_label, cluster_id
             }
         ],
         "min_bubble_size": "8",
-        "max_bubble_size": "32",
+        "max_bubble_size": "28",
         "opacity": 0.65,
         "show_legend": True,
         "legendOrientation": "top",
         "truncateXAxis": False,
         "row_limit": 200,
         "order_desc": True,
-        "x_axis_label": "Velocity (pts/min)",
+        "x_axis_label": "Velocity (pts/min) — Top-Right: Breakout | Bottom-Right: Cooling | Left: Dormant",
         "y_axis_label": "Acceleration (pts/min²)",
+        "x_axis_title_margin": 40,
+        "y_axis_title_margin": 40,
+        "bottom_margin": 50,
+        "left_margin": 50,
+        "data_zoom": True,
+        "zoomable": True,
+        "label_colors": {
+            "Breakout": "#34d399",
+            "Cooling": "#2dd4bf",
+            "Steady": "#60a5fa",
+            "Dormant": "#94a3b8"
+        },
         "color_scheme": "supersetColors"
     }
     s2 = db.session.query(Slice).filter_by(slice_name=slice2_name).first()
@@ -1082,12 +1149,12 @@ GROUP BY cluster_label, cluster_id
         dash.slices = all_dashboard_slices
         dash.published = True
 
-    # Header Markdown: Title ⚡, Badges (🔴 LIVE, ⏱️ 10s REFRESH, 📡 HACKER NEWS API in order)
+    # Header Markdown: Title ⚡, Badges (🔴 LIVE, ⏱️ 10s REFRESH, 📡 HACKER NEWS API in order, Last data: 15:30 IST)
     header_text = (
         "# ⚡ InfoVelocity\n"
         "### Real-Time Narrative Intelligence\n"
         "*Monitor how quickly online discussions gain engagement momentum.* &nbsp;&nbsp; "
-        "`🔴 LIVE` &nbsp; `⏱️ 10s REFRESH` &nbsp; `📡 HACKER NEWS API`"
+        "`🔴 LIVE` &nbsp; `⏱️ 10s REFRESH` &nbsp; `📡 HACKER NEWS API` &nbsp; `⏱️ Last data: 15:30 IST`"
     )
 
     # Disclaimer Banner: Prefixed with ⚠️ ONLY, no scrambled emojis
@@ -1172,7 +1239,7 @@ GROUP BY cluster_label, cluster_id
                 "code": disclaimer_text
             }
         },
-        # Row 1: 5 Reconciled KPIs (2, 2, 2, 3, 3 = 12 columns, equal height 16)
+        # Row 1: 6 Reconciled KPIs (2, 2, 2, 2, 2, 2 = 12 columns, equal height 16)
         "ROW_KPIS": {
             "type": "ROW",
             "id": "ROW_KPIS",
@@ -1181,7 +1248,8 @@ GROUP BY cluster_label, cluster_id
                 f"CHART-{kpi2.id}",
                 f"CHART-{kpi3.id}",
                 f"CHART-{kpi4.id}",
-                f"CHART-{kpi5.id}"
+                f"CHART-{kpi5.id}",
+                f"CHART-{kpi6.id}"
             ],
             "parents": ["ROOT_ID", "GRID_ID"],
             "meta": {
@@ -1233,7 +1301,7 @@ GROUP BY cluster_label, cluster_id
             "children": [],
             "parents": ["ROOT_ID", "GRID_ID", "ROW_KPIS"],
             "meta": {
-                "width": 3,
+                "width": 2,
                 "height": 16,
                 "chartId": kpi4.id,
                 "sliceName": kpi4.slice_name,
@@ -1246,11 +1314,24 @@ GROUP BY cluster_label, cluster_id
             "children": [],
             "parents": ["ROOT_ID", "GRID_ID", "ROW_KPIS"],
             "meta": {
-                "width": 3,
+                "width": 2,
                 "height": 16,
                 "chartId": kpi5.id,
                 "sliceName": kpi5.slice_name,
                 "uuid": str(kpi5.uuid) if kpi5.uuid else f"chart-uuid-{kpi5.id}"
+            }
+        },
+        f"CHART-{kpi6.id}": {
+            "type": "CHART",
+            "id": f"CHART-{kpi6.id}",
+            "children": [],
+            "parents": ["ROOT_ID", "GRID_ID", "ROW_KPIS"],
+            "meta": {
+                "width": 2,
+                "height": 16,
+                "chartId": kpi6.id,
+                "sliceName": kpi6.slice_name,
+                "uuid": str(kpi6.uuid) if kpi6.uuid else f"chart-uuid-{kpi6.id}"
             }
         },
         # Row 2: Trend & Momentum Map (6, 6 = 12 columns, height 60)
@@ -1524,10 +1605,16 @@ GROUP BY cluster_label, cluster_id
         "color_scheme": "supersetColors",
         "refresh_frequency": 10,
         "timed_refresh_immune_slices": [],
+        "label_colors": {
+            "Breakout": "#34d399",
+            "Cooling": "#2dd4bf",
+            "Steady": "#60a5fa",
+            "Dormant": "#94a3b8"
+        },
         "native_filter_configuration": native_filters
     }, ensure_ascii=False)
 
     db.session.commit()
     print(f"\n[SUCCESS] Dashboard '{dash.dashboard_title}' successfully provisioned!")
     print(f"Dashboard ID: {dash.id} | Slug: {dash.slug} | URL: /superset/dashboard/{dash.slug}/")
-    print(f"Total Slices Configured: {len(dash.slices)} (5 KPIs + 6 Visualizations)")
+    print(f"Total Slices Configured: {len(dash.slices)} (6 KPIs + 6 Visualizations)")

@@ -353,17 +353,17 @@ def process_snapshots_data(records: list[dict], poll_interval: int = POLL_INTERV
 
             if v_score is not None and a_score is not None:
                 if v_score > 0 and a_score > 0:
-                    quadrant = "Breakout (Accelerating)"
+                    quadrant = "Breakout"
                 elif v_score > 0 and a_score < 0:
-                    quadrant = "Cooling (Slowing)"
+                    quadrant = "Cooling"
                 elif v_score > 0 and (a_score == 0 or a_score is None):
-                    quadrant = "Steady (Linear Growth)"
+                    quadrant = "Steady"
                 else:
-                    quadrant = "Fading / Dormant"
+                    quadrant = "Dormant"
             elif v_score is not None and v_score > 0:
-                quadrant = "Steady (Linear Growth)"
+                quadrant = "Steady"
             else:
-                quadrant = "Fading / Dormant"
+                quadrant = "Dormant"
 
             # Assign computed fields
             snap["dt_sec"] = dt_sec

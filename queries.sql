@@ -69,9 +69,19 @@ WHERE "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
 
 
 -- ----------------------------------------------------------------------------
+-- QUERY 3c: Data Freshness (KPI 6)
+-- ----------------------------------------------------------------------------
+-- Superset Viz: Big Number Total (Minutes since last snapshot, red warning if > 5m)
+
+SELECT 
+    ROUND(CAST(TIMESTAMPDIFF(SECOND, MAX("__time"), CURRENT_TIMESTAMP) AS DOUBLE) / 60.0, 1) AS freshness_minutes
+FROM "hn_snapshots";
+
+
+-- ----------------------------------------------------------------------------
 -- QUERY 4: Engagement Velocity — 5-Minute Trend (Macro Dual Time-Series)
 -- ----------------------------------------------------------------------------
--- Superset Viz: echarts_timeseries_line (Score vs Comment Velocity)
+-- Superset Viz: echarts_timeseries_line (Score vs Comment Velocity with markers and gap breaks)
 
 SELECT
     TIME_FLOOR("__time", 'PT5M') AS bucket_time,
@@ -80,7 +90,10 @@ SELECT
     COUNT(DISTINCT author) AS active_authors,
     ROUND(AVG(v_score), 4) AS avg_score_velocity,
     ROUND(MAX(v_score), 4) AS peak_score_velocity,
-    ROUND(AVG(v_comment), 4) AS avg_comment_velocity,
+    CASE WHEN COUNT(CASE WHEN v_comment > 0 THEN 1 END) > 0 OR SUM(v_comment) > 0
+         THEN ROUND(AVG(v_comment), 4)
+         ELSE NULL
+    END AS avg_comment_velocity,
     ROUND(MAX(v_comment), 4) AS peak_comment_velocity
 FROM "hn_snapshots"
 WHERE "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
@@ -100,7 +113,7 @@ SELECT
     quadrant,
     AVG(score_velocity_per_minute) AS x_velocity,
     AVG(score_acceleration) AS y_acceleration,
-    ROUND(SQRT(GREATEST(MAX(current_score), 1)), 2) AS bubble_size_sqrt
+    CASE WHEN AVG(score_velocity_per_minute) = 0 AND AVG(score_acceleration) = 0 THEN 1.0 ELSE ROUND(SQRT(GREATEST(MAX(current_score), 1)), 2) END AS bubble_size_sqrt
 FROM (
     SELECT
         post_id,
@@ -113,6 +126,7 @@ FROM (
     FROM "hn_snapshots"
     WHERE latest_flag = 1 
       AND eligible = 1
+      AND "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
     GROUP BY post_id, title, author, score, v_score, a_score, quadrant
 ) sub
 GROUP BY title, author, quadrant
