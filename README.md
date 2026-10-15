@@ -103,39 +103,55 @@ InfoVelocity was originally prototyped with a Reddit ingestion poller (`reddit_p
 
 ---
 
-## Mathematical Model
+## Mathematical Model & Kinematics Windows
 
-InfoVelocity models user interaction along discrete snapshot observations $(t_0, t_1, \dots, t_n)$ for each tracked story.
+InfoVelocity computes robust moving-window kinematics across discrete snapshot observations $(t_0, t_1, \dots, t_n)$ for each tracked story.
 
-### 1. Instantaneous Velocity (First Derivative)
-Velocity measures the current rate of engagement growth per unit time (normalized to points/minute and comments/minute):
+### 1. 5-Minute Velocity Window ($W = 5\text{ min}$)
+Instead of noisy 1-minute delta comparisons, velocity measures engagement change over a 5-minute window (`VELOCITY_WINDOW_MIN = 5`):
+$$v_{\text{score}}(t) = \frac{\text{score}(t) - \text{score}(t - W)}{W_{\text{actual}}} \quad \left[\frac{\text{points}}{\text{minute}}\right]$$
+$$v_{\text{comment}}(t) = \frac{\text{comments}(t) - \text{comments}(t - W)}{W_{\text{actual}}} \quad \left[\frac{\text{comments}}{\text{minute}}\right]$$
 
-$$v_{\text{score}}(t) = \frac{\text{score}_t - \text{score}_{t-1}}{(t - t_{t-1}) / 60.0} \quad \left[\frac{\text{score points}}{\text{minute}}\right]$$
+- **Reference Snapshot**: The nearest observation to $t - W$ within a tolerance of $\pm \text{poll interval}$ (60s). $W_{\text{actual}}$ uses the real elapsed minutes $(t - t_{\text{ref}}) / 60.0$.
+- **Collector Outage Guard**: If no reference snapshot exists within tolerance or if any observation gap in the window exceeds $3 \times \text{poll interval}$ (180s), $v$ is set to `null` (never 0).
 
-$$v_{\text{comment}}(t) = \frac{\text{comments}_t - \text{comments}_{t-1}}{(t - t_{t-1}) / 60.0} \quad \left[\frac{\text{comments}}{\text{minute}}\right]$$
+### 2. 10-Minute Acceleration Window ($A = 10\text{ min}$)
+Acceleration measures the rate of change between two successive 10-minute velocity measurements (`ACCEL_WINDOW_MIN = 10`):
+$$a_{\text{score}}(t) = \frac{v_A(t) - v_A(t - A)}{A_{\text{actual}}} \quad \left[\frac{\text{points}}{\text{minute}^2}\right]$$
+$$a_{\text{comment}}(t) = \frac{v_{\text{comm},A}(t) - v_{\text{comm},A}(t - A)}{A_{\text{actual}}} \quad \left[\frac{\text{comments}}{\text{minute}^2}\right]$$
 
-### 2. Velocity Acceleration (Second Derivative)
-Acceleration measures the rate of change in velocity. A positive acceleration indicates an **emerging narrative spurt** or breakout event:
+- **History Requirement**: Calculating $a(t)$ requires at least $2A$ (20 minutes) of continuous tracking history ($t \to t - A \to t - 2A$). Stories with less than 20 minutes of history yield `null`.
+- **Collector Outage Guard**: Any observation gap exceeding $3 \times \text{poll interval}$ within the 20-minute window sets $a$ to `null`.
 
-$$a_{\text{score}}(t) = \frac{v_{\text{score}}(t) - v_{\text{score}}(t-1)}{(t - t_{t-1}) / 60.0} \quad \left[\frac{\text{score points}}{\text{minute}^2}\right]$$
-
-$$a_{\text{comment}}(t) = \frac{v_{\text{comment}}(t) - v_{\text{comment}}(t-1)}{(t - t_{t-1}) / 60.0} \quad \left[\frac{\text{comments}}{\text{minute}^2}\right]$$
+### 3. Extra Context & Derived Kinematics Metrics
+- **30-Minute Velocity ($v_{\text{score\_30m}}$)**: Macro velocity measured over a 30-minute lookback window (`VELOCITY_30M_WINDOW_MIN = 30`) to gauge medium-term sustained traction.
+- **Normalized Acceleration ($a_{\text{norm}}$)**: Scaling acceleration by current score to compare virality across differently sized posts:
+  $$a_{\text{norm}} = \frac{a_{\text{score}}}{\max(\text{score}, 1)}$$
+- **Weighted Velocity Rank ($\text{rank\_score}$)**: Engagement velocity weighted by logarithmic score scale:
+  $$\text{rank\_score} = v_{\text{score}} \cdot \ln(1 + \text{score})$$
 
 ---
 
-## Data Collection & Snapshot Architecture
+## Data Collection & Active Pool Management
 
-Data ingestion is orchestrated by [`hn_collector.py`](file:///c:/Users/RITHIKESH%20S/InfoVelocity/hn_collector.py):
+Data ingestion is orchestrated by [`hn_collector.py`](file:///c:/Users/RITHIKESH%20S/InfoVelocity/hn_collector.py) and supervised via [`run_collector_service.py`](file:///c:/Users/RITHIKESH%20S/InfoVelocity/run_collector_service.py):
 
-### 1. Dual-Stream Output Design
-- **`hn_events.jsonl` (Immutable Catalog)**: Appends each newly discovered story once upon initial detection (deduplicated by `post_id`).
-- **`hn_snapshots.jsonl` (Time-Series Metric Log)**: Periodically records engagement metrics for all actively tracked stories. Each record captures the observation timestamp (`timestamp` / `__time`) alongside the original story publication time (`created_at`).
+### 1. Multi-Endpoint Discovery
+On every 60-second cycle, the collector samples across three primary Hacker News Firebase REST endpoints:
+- `/v0/newstories.json`: Newly submitted posts.
+- `/v0/topstories.json`: Current front-page ranking stories.
+- `/v0/beststories.json`: High-scoring trending narratives.
 
-### 2. Active Pool Management (Sliding Window)
-To prevent unbound memory and network consumption, the collector maintains an active pool of stories:
-- **`ACTIVE_STORY_LIMIT`** (default: `100`): Maximum stories actively sampled per snapshot cycle.
-- **`ACTIVE_WINDOW_HOURS`** (default: `12`): Stories older than 12 hours are automatically retired from active snapshotting.
-- **Deduplication**: Loads existing IDs on startup to avoid re-cataloging across restarts.
+### 2. Active Pool Management (24-Hour Sliding Window)
+- **Target Capacity**: Tracks up to ~300 active stories (`ACTIVE_STORY_LIMIT = 300`).
+- **Freshness Cutoff**: Stories older than 24 hours (`now - created_at > 24h`) are dropped from the active tracking pool. Their historical snapshots remain immutable in storage.
+- **Cycle Structured Logging**: Emits per-cycle logs indicating `Pool size`, `New stories added`, and `Stories dropped`:
+  ```
+  [Active Pool] Pool size: 284 | New stories added: 12 | Stories dropped: 4
+  [HEARTBEAT] Collector active | Polled at 2026-10-15T12:45:00Z | Pool: 284 stories | Status: HEALTHY | Mode: LIVE
+  ```
+- **UTF-8 Clean**: All titles and text are cleaned of double-encoded mojibake before writing.
+- **Automated Druid Sync**: Automatically uploads snapshots and narrative clusters to Apache Druid upon every cycle completion.
 
 ### 3. Clean Hacker News URL Handling
 External URLs are preserved when available (link submissions). For self/text posts (Ask HN, Show HN, Tell HN) or items without an external URL, clean fallback routing is applied:

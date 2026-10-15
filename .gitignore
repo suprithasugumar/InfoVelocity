@@ -12,3 +12,6 @@ collector.log
 *.log
 reddit_posts.jsonl
 reddit_events.jsonl
+*.bak
+*.bak*
+scratch/

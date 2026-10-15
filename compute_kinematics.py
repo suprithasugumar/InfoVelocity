@@ -2,15 +2,19 @@
 """
 InfoVelocity - Kinematics Processing & Narrative Clustering Pipeline
 ====================================================================
-Computes instantaneous velocity (1st derivative) and acceleration (2nd derivative)
-for each story across sequential time snapshots in Python before Druid ingestion.
-Precomputes display columns (title_link, story_age, observation_time_ist, quadrant).
-
-Separation of Concerns:
-- Story rows in hn_snapshots contain ONLY story metrics and kinematics.
-- Narrative clusters are generated into a separate dataset (hn_clusters.jsonl)
-  with min 2 stories per cluster, grouped by title similarity first.
-- Strict UTF-8 encoding end-to-end to eliminate mojibake.
+Computes 5-minute velocity, 10-minute acceleration, and 30-minute velocity:
+  - VELOCITY_WINDOW_MIN = 5 (W = 300s):
+      v_score(t) = (score(t) - score(t - W)) / W_actual
+      Reference snapshot nearest to t - W (tolerance +/- 90s). Same for v_comment.
+  - ACCEL_WINDOW_MIN = 10 (A = 600s):
+      a_score(t) = (v_A(t) - v_A(t - A)) / A_actual
+      Needs 2A (20 min) of history, otherwise null. Same for comment acceleration.
+  - v_score_30m: 30-minute velocity as extra context.
+  - a_norm = a_score / max(score, 1)
+  - rank_score = v_score * ln(1 + score)
+  - If no reference snapshot exists within tolerance, or gap > 3x poll interval: null (never 0).
+  - Precomputes display dimensions (title_link, story_age, observation_time_ist, quadrant).
+  - Narrative clusters generated into dedicated hn_clusters.jsonl (min 2 stories, title similarity).
 """
 
 import os
@@ -26,11 +30,18 @@ from collections import defaultdict, Counter
 
 # Configurable constants
 POLL_INTERVAL_DEFAULT = 60
+VELOCITY_WINDOW_MIN = 5
+ACCEL_WINDOW_MIN = 10
+VELOCITY_30M_WINDOW_MIN = 30
+
+VELOCITY_WINDOW_SEC = VELOCITY_WINDOW_MIN * 60.0       # 300.0s
+ACCEL_WINDOW_SEC = ACCEL_WINDOW_MIN * 60.0             # 600.0s
+VELOCITY_30M_WINDOW_SEC = VELOCITY_30M_WINDOW_MIN * 60.0 # 1800.0s
+
+TOLERANCE_SEC = 90.0            # Tolerance for 5m and 10m window matching (+/- 1.5 intervals)
+TOLERANCE_30M_SEC = 180.0       # Tolerance for 30m window matching
 MIN_DT_SEC = 20.0
-MIN_ACCELERATION_DT_SEC = 20.0
-MIN_ACCELERATION_DSCORE = 1
 ACCELERATION_CAP_THRESHOLD = 500.0
-LOOKBACK_TARGET_SEC = 300.0
 MIN_ELIGIBLE_SCORE = 2
 MIN_ELIGIBLE_COMMENTS = 1
 
@@ -61,10 +72,12 @@ def fix_mojibake(text: str) -> str:
         'â€': '”',
         'Ã©': 'é',
         'â€¦': '…',
-        'Â': ''
+        'Â': '',
+        '\ufffd': '—'
     }
     for bad, good in replacements.items():
-        text = text.replace(bad, good)
+        if bad:
+            text = text.replace(bad, good)
     return text.strip()
 
 
@@ -89,15 +102,29 @@ def parse_timestamp_to_epoch(ts_str: str) -> float:
         return 0.0
 
 
+def check_outage_gap(history_slice: list[dict], max_gap_sec: float) -> bool:
+    """Returns True if any gap between consecutive snapshots in history_slice exceeds max_gap_sec."""
+    for idx in range(1, len(history_slice)):
+        if (history_slice[idx]["epoch"] - history_slice[idx - 1]["epoch"]) > max_gap_sec:
+            return True
+    return False
+
+
 def process_snapshots_data(records: list[dict], poll_interval: int = POLL_INTERVAL_DEFAULT) -> list[dict]:
     """
     Groups records by post_id, sorts chronologically, and computes:
-    - Kinematics (v_score, v_comment, a_score, a_comment, rank_score, a_norm)
+    - 5-min velocity: v_score, v_comment
+    - 30-min velocity: v_score_30m
+    - 10-min acceleration: a_score, a_comment (requires 20 min history)
+    - Normalized metrics: a_norm, rank_score
     - Latest flag & eligibility
-    - Precomputed display dimensions (title_link, story_age, observation_time_ist, quadrant)
-    NOTE: Never writes cluster fields into story rows (kept in separate hn_clusters).
+    - Display dimensions: title_link, story_age, observation_time_ist, quadrant
     """
-    max_gap = max(3 * poll_interval, 900)  # Allow at least 15 min gap for cold polls
+    max_gap = 3.0 * poll_interval  # Gap threshold for outage detection (e.g. 180s)
+    now_epoch = datetime.now(timezone.utc).timestamp()
+
+    tolerance_sec = float(poll_interval)
+    tolerance_30m_sec = 2.0 * float(poll_interval)
 
     by_post = defaultdict(list)
     for idx, rec in enumerate(records):
@@ -122,6 +149,7 @@ def process_snapshots_data(records: list[dict], poll_interval: int = POLL_INTERV
             dt_sec = None
             v_score = None
             v_comment = None
+            v_score_30m = None
             a_score = None
             a_comment = None
             a_norm = None
@@ -129,77 +157,92 @@ def process_snapshots_data(records: list[dict], poll_interval: int = POLL_INTERV
             is_capped = 0
 
             if history and ts_epoch > 0:
-                target_epoch = ts_epoch - LOOKBACK_TARGET_SEC
-                best_prev = min(history, key=lambda h: abs(h["epoch"] - target_epoch))
-                t_prev = best_prev["epoch"]
-                score_prev = best_prev["score"]
-                comment_prev = best_prev["comments"]
-                dt_prev = best_prev.get("dt_sec")
-                v_score_prev = best_prev.get("v_score")
-                v_comment_prev = best_prev.get("v_comment")
+                # -------------------------------------------------------------
+                # 1. 5-Minute Velocity: v_score, v_comment
+                # -------------------------------------------------------------
+                # Nearest snapshot to t - 300s within tolerance (+/- poll_interval)
+                v5_candidates = [
+                    h for h in history 
+                    if abs((ts_epoch - h["epoch"]) - VELOCITY_WINDOW_SEC) <= tolerance_sec
+                ]
+                if v5_candidates:
+                    ref_5m = min(v5_candidates, key=lambda h: abs((ts_epoch - h["epoch"]) - VELOCITY_WINDOW_SEC))
+                    dt_val = ts_epoch - ref_5m["epoch"]
+                    if dt_val >= MIN_DT_SEC:
+                        # Check for collector outage gap in window
+                        sub_hist = [h for h in history if ref_5m["epoch"] <= h["epoch"] <= ts_epoch] + [{"epoch": ts_epoch}]
+                        if not check_outage_gap(sub_hist, max_gap):
+                            dt_sec = round(dt_val, 2)
+                            dt_min = dt_val / 60.0
+                            dscore = score - ref_5m["score"]
+                            dcomment = comments - ref_5m["comments"]
+                            v_score = round(dscore / dt_min, 4)
+                            v_comment = round(dcomment / dt_min, 4)
+                            rank_score = round(v_score * math.log(1.0 + max(score, 0)), 4)
 
-                dt_val = ts_epoch - t_prev
-                if dt_val >= 0:
-                    dt_sec = round(dt_val, 2)
+                # -------------------------------------------------------------
+                # 2. 30-Minute Velocity: v_score_30m
+                # -------------------------------------------------------------
+                v30_candidates = [
+                    h for h in history 
+                    if abs((ts_epoch - h["epoch"]) - VELOCITY_30M_WINDOW_SEC) <= tolerance_30m_sec
+                ]
+                if v30_candidates:
+                    ref_30m = min(v30_candidates, key=lambda h: abs((ts_epoch - h["epoch"]) - VELOCITY_30M_WINDOW_SEC))
+                    dt_30m_val = ts_epoch - ref_30m["epoch"]
+                    if dt_30m_val >= MIN_DT_SEC:
+                        dt_30m_min = dt_30m_val / 60.0
+                        dscore_30m = score - ref_30m["score"]
+                        v_score_30m = round(dscore_30m / dt_30m_min, 4)
 
-                if dt_sec is not None and MIN_DT_SEC <= dt_sec <= max_gap:
-                    dt_min = dt_sec / 60.0
-                    dscore = max(0, score - score_prev)
-                    dcomment = max(0, comments - comment_prev)
+                # -------------------------------------------------------------
+                # 3. 10-Minute Acceleration: a_score, a_comment
+                # -------------------------------------------------------------
+                # a_score(t) = (v_A(t) - v_A(t - A)) / A with A = 10 min.
+                # Needs 2A (20 min) of history, otherwise null.
+                earliest_epoch = history[0]["epoch"]
+                if (ts_epoch - earliest_epoch) >= (2.0 * ACCEL_WINDOW_SEC - tolerance_sec):
+                    # Find ref1 around t - 10m (600s)
+                    cand_10m_1 = [
+                        h for h in history 
+                        if abs((ts_epoch - h["epoch"]) - ACCEL_WINDOW_SEC) <= tolerance_sec
+                    ]
+                    if cand_10m_1:
+                        ref1 = min(cand_10m_1, key=lambda h: abs((ts_epoch - h["epoch"]) - ACCEL_WINDOW_SEC))
+                        t1 = ref1["epoch"]
+                        # Find ref2 around t1 - 10m (600s) -> total ~20m
+                        cand_10m_2 = [
+                            h for h in history 
+                            if abs((t1 - h["epoch"]) - ACCEL_WINDOW_SEC) <= tolerance_sec
+                        ]
+                        if cand_10m_2:
+                            ref2 = min(cand_10m_2, key=lambda h: abs((t1 - h["epoch"]) - ACCEL_WINDOW_SEC))
+                            dt1_val = ts_epoch - t1
+                            dt2_val = t1 - ref2["epoch"]
+                            if dt1_val >= MIN_DT_SEC and dt2_val >= MIN_DT_SEC:
+                                sub_hist_acc = [h for h in history if ref2["epoch"] <= h["epoch"] <= ts_epoch] + [{"epoch": ts_epoch}]
+                                if not check_outage_gap(sub_hist_acc, max_gap):
+                                    dt1_min = dt1_val / 60.0
+                                    dt2_min = dt2_val / 60.0
+                                    v_A_now = (score - ref1["score"]) / dt1_min
+                                    v_A_prev = (ref1["score"] - ref2["score"]) / dt2_min
+                                    raw_a = (v_A_now - v_A_prev) / dt1_min
 
-                    v_score = round(dscore / dt_min, 4)
-                    v_comment = round(dcomment / dt_min, 4)
+                                    v_comm_A_now = (comments - ref1["comments"]) / dt1_min
+                                    v_comm_A_prev = (ref1["comments"] - ref2["comments"]) / dt2_min
+                                    raw_a_comm = (v_comm_A_now - v_comm_A_prev) / dt1_min
 
-                    if v_score_prev is None or dt_prev is None:
-                        valid_prior = [h for h in history if h.get("v_score") is not None and h.get("dt_sec") is not None]
-                        if valid_prior:
-                            best_v_prev = min(valid_prior, key=lambda h: abs(h["epoch"] - (ts_epoch - MIN_ACCELERATION_DT_SEC)))
-                            v_score_prev = best_v_prev.get("v_score")
-                            v_comment_prev = best_v_prev.get("v_comment")
-                            dt_prev = best_v_prev.get("dt_sec")
-                            dt_acc_sec = max(ts_epoch - best_v_prev["epoch"], 1.0)
-                        else:
-                            dt_acc_sec = dt_sec
-                    else:
-                        dt_acc_sec = dt_sec
-
-                    dt_acc_min = dt_acc_sec / 60.0
-
-                    if (v_score_prev is not None and 
-                        dt_sec >= MIN_ACCELERATION_DT_SEC and 
-                        dt_prev is not None and dt_prev >= MIN_ACCELERATION_DT_SEC and 
-                        dscore >= MIN_ACCELERATION_DSCORE):
-
-                        raw_a = (v_score - v_score_prev) / dt_acc_min
-                        if raw_a > ACCELERATION_CAP_THRESHOLD:
-                            a_score = ACCELERATION_CAP_THRESHOLD
-                            is_capped = 1
-                        else:
-                            a_score = round(raw_a, 6)
-                            is_capped = 0
-                        a_norm = round(a_score / max(score, 1), 6)
-                    else:
-                        a_score = None
-                        a_norm = None
-                        is_capped = 0
-
-                    if (v_comment_prev is not None and 
-                        dt_sec >= MIN_ACCELERATION_DT_SEC and 
-                        dt_prev is not None and dt_prev >= MIN_ACCELERATION_DT_SEC and 
-                        dcomment >= 1):
-                        a_comment = round((v_comment - v_comment_prev) / dt_acc_min, 6)
-                    else:
-                        a_comment = None
-
-                    rank_score = round(v_score * math.log(1.0 + max(score, 0)), 4)
-                else:
-                    v_score = None
-                    v_comment = None
-                    a_score = None
-                    a_comment = None
-                    a_norm = None
-                    rank_score = None
-                    is_capped = 0
+                                    if raw_a > ACCELERATION_CAP_THRESHOLD:
+                                        a_score = ACCELERATION_CAP_THRESHOLD
+                                        is_capped = 1
+                                    elif raw_a < -ACCELERATION_CAP_THRESHOLD:
+                                        a_score = -ACCELERATION_CAP_THRESHOLD
+                                        is_capped = 1
+                                    else:
+                                        a_score = round(raw_a, 6)
+                                        is_capped = 0
+                                    a_norm = round(a_score / max(score, 1), 6)
+                                    a_comment = round(raw_a_comm, 6)
 
             # Precomputed display dimensions
             raw_title = str(snap.get("title") or "").strip()
@@ -211,7 +254,8 @@ def process_snapshots_data(records: list[dict], poll_interval: int = POLL_INTERV
             title_link = f'<a href="{link_target}" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: none; font-weight: 500;">{clean_title}</a>'
 
             created_epoch = parse_timestamp_to_epoch(snap.get("created_at"))
-            diff_sec = max(0, ts_epoch - created_epoch) if (ts_epoch > 0 and created_epoch > 0) else 0
+            # Story Age = now - created_at (or ts_epoch - created_epoch)
+            diff_sec = max(0, (now_epoch if latest_flag == 1 else ts_epoch) - created_epoch) if created_epoch > 0 else 0
             if diff_sec < 3600:
                 story_age = f"{int(round(diff_sec / 60.0))}m"
             elif diff_sec < 86400:
@@ -243,6 +287,7 @@ def process_snapshots_data(records: list[dict], poll_interval: int = POLL_INTERV
             snap["dt_sec"] = dt_sec
             snap["v_score"] = v_score
             snap["v_comment"] = v_comment
+            snap["v_score_30m"] = v_score_30m
             snap["a_score"] = a_score
             snap["a_comment"] = a_comment
             snap["a_norm"] = a_norm
@@ -255,7 +300,7 @@ def process_snapshots_data(records: list[dict], poll_interval: int = POLL_INTERV
             snap["observation_time_ist"] = observation_time_ist
             snap["quadrant"] = quadrant
 
-            # Ensure cluster fields are NOT present in story records
+            # Never write cluster columns into story snapshot rows
             snap.pop("cluster_id", None)
             snap.pop("cluster_label", None)
 
@@ -264,10 +309,7 @@ def process_snapshots_data(records: list[dict], poll_interval: int = POLL_INTERV
             history.append({
                 "epoch": ts_epoch,
                 "score": score,
-                "comments": comments,
-                "dt_sec": dt_sec,
-                "v_score": v_score,
-                "v_comment": v_comment
+                "comments": comments
             })
 
     return [r for r in updated_records if r is not None]
@@ -280,8 +322,8 @@ def generate_clusters_dataset(snapshots: list[dict], min_stories: int = 2, outpu
     - Groups stories by title similarity first (shared key phrases & semantic topics).
     - Strictly enforces min 2 stories per cluster (never singletons).
     - Writes records to hn_clusters.jsonl without polluting story rows.
+    - If no clusters found, writes empty file.
     """
-    # 1. Map latest stories
     latest_stories = {}
     for r in snapshots:
         if r.get("latest_flag") == 1:
@@ -289,7 +331,6 @@ def generate_clusters_dataset(snapshots: list[dict], min_stories: int = 2, outpu
             latest_stories[pid] = r
 
     if not latest_stories:
-        # Fallback to latest snapshot per post_id
         by_post = defaultdict(list)
         for r in snapshots:
             by_post[str(r["post_id"])].append(r)
@@ -315,7 +356,7 @@ def generate_clusters_dataset(snapshots: list[dict], min_stories: int = 2, outpu
     assigned_pids = set()
     cluster_objects = []
 
-    # 1. Check thematic groups
+    # 1. Thematic groups
     for cid, cname, kw_set in thematic_groups:
         matched = []
         for pid, s in latest_stories.items():
@@ -334,7 +375,7 @@ def generate_clusters_dataset(snapshots: list[dict], min_stories: int = 2, outpu
                 "stories": matched
             })
 
-    # 2. Dynamic title keyword overlap for remaining unassigned stories
+    # 2. Dynamic title keyword overlap
     keyword_freq = {t: len(pids - assigned_pids) for t, pids in token_to_pids.items()}
     sorted_keywords = sorted(keyword_freq.items(), key=lambda x: x[1], reverse=True)
 
@@ -351,10 +392,11 @@ def generate_clusters_dataset(snapshots: list[dict], min_stories: int = 2, outpu
                 "stories": candidates
             })
 
-    # Find global latest timestamp for cluster snapshot
-    latest_ts = max((r.get("timestamp") for r in snapshots if r.get("timestamp")), default=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    latest_ts = max(
+        (r.get("timestamp") for r in snapshots if r.get("timestamp")), 
+        default=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
 
-    # Build cluster records
     cluster_records = []
     for c in cluster_objects:
         st_list = c["stories"]
@@ -432,7 +474,6 @@ class StoryKinematicsTracker:
     """
     def __init__(self, poll_interval: int = POLL_INTERVAL_DEFAULT):
         self.poll_interval = poll_interval
-        self.max_gap = max(3 * poll_interval, 900)
         self.history = defaultdict(list)
 
     def seed_from_file(self, snapshots_file: str):
@@ -468,6 +509,7 @@ class StoryKinematicsTracker:
         dt_sec = None
         v_score = None
         v_comment = None
+        v_score_30m = None
         a_score = None
         a_comment = None
         a_norm = None
@@ -475,49 +517,85 @@ class StoryKinematicsTracker:
         is_capped = 0
 
         hist = self.history[post_id]
+        tolerance_sec = float(self.poll_interval)
+        tolerance_30m_sec = 2.0 * float(self.poll_interval)
+        max_gap = 3.0 * float(self.poll_interval)
+
         if hist and ts_epoch > 0:
-            target_epoch = ts_epoch - LOOKBACK_TARGET_SEC
-            best_prev = min(hist, key=lambda h: abs(h["epoch"] - target_epoch))
-            t_prev = best_prev["epoch"]
-            score_prev = best_prev["score"]
-            comment_prev = best_prev["comments"]
-            dt_prev = best_prev.get("dt_sec")
-            v_score_prev = best_prev.get("v_score")
-            v_comment_prev = best_prev.get("v_comment")
+            # 5m velocity
+            v5_candidates = [
+                h for h in hist 
+                if abs((ts_epoch - h["epoch"]) - VELOCITY_WINDOW_SEC) <= tolerance_sec
+            ]
+            if v5_candidates:
+                ref_5m = min(v5_candidates, key=lambda h: abs((ts_epoch - h["epoch"]) - VELOCITY_WINDOW_SEC))
+                dt_val = ts_epoch - ref_5m["epoch"]
+                if dt_val >= MIN_DT_SEC:
+                    sub_hist = [h for h in hist if ref_5m["epoch"] <= h["epoch"] <= ts_epoch] + [{"epoch": ts_epoch}]
+                    if not check_outage_gap(sub_hist, max_gap):
+                        dt_sec = round(dt_val, 2)
+                        dt_min = dt_val / 60.0
+                        dscore = score - ref_5m["score"]
+                        dcomment = comments - ref_5m["comments"]
+                        v_score = round(dscore / dt_min, 4)
+                        v_comment = round(dcomment / dt_min, 4)
+                        rank_score = round(v_score * math.log(1.0 + max(score, 0)), 4)
 
-            dt_val = ts_epoch - t_prev
-            if dt_val >= 0:
-                dt_sec = round(dt_val, 2)
+            # 30m velocity
+            v30_candidates = [
+                h for h in hist 
+                if abs((ts_epoch - h["epoch"]) - VELOCITY_30M_WINDOW_SEC) <= tolerance_30m_sec
+            ]
+            if v30_candidates:
+                ref_30m = min(v30_candidates, key=lambda h: abs((ts_epoch - h["epoch"]) - VELOCITY_30M_WINDOW_SEC))
+                dt_30m_val = ts_epoch - ref_30m["epoch"]
+                if dt_30m_val >= MIN_DT_SEC:
+                    dt_30m_min = dt_30m_val / 60.0
+                    dscore_30m = score - ref_30m["score"]
+                    v_score_30m = round(dscore_30m / dt_30m_min, 4)
 
-            if dt_sec is not None and MIN_DT_SEC <= dt_sec <= self.max_gap:
-                dt_min = dt_sec / 60.0
-                dscore = max(0, score - score_prev)
-                dcomment = max(0, comments - comment_prev)
+            # 10m acceleration (requires 20m history)
+            earliest_epoch = hist[0]["epoch"]
+            if (ts_epoch - earliest_epoch) >= (2.0 * ACCEL_WINDOW_SEC - tolerance_sec):
+                cand_10m_1 = [
+                    h for h in hist 
+                    if abs((ts_epoch - h["epoch"]) - ACCEL_WINDOW_SEC) <= tolerance_sec
+                ]
+                if cand_10m_1:
+                    ref1 = min(cand_10m_1, key=lambda h: abs((ts_epoch - h["epoch"]) - ACCEL_WINDOW_SEC))
+                    t1 = ref1["epoch"]
+                    cand_10m_2 = [
+                        h for h in hist 
+                        if abs((t1 - h["epoch"]) - ACCEL_WINDOW_SEC) <= tolerance_sec
+                    ]
+                    if cand_10m_2:
+                        ref2 = min(cand_10m_2, key=lambda h: abs((t1 - h["epoch"]) - ACCEL_WINDOW_SEC))
+                        dt1_val = ts_epoch - t1
+                        dt2_val = t1 - ref2["epoch"]
+                        if dt1_val >= MIN_DT_SEC and dt2_val >= MIN_DT_SEC:
+                            sub_hist_acc = [h for h in hist if ref2["epoch"] <= h["epoch"] <= ts_epoch] + [{"epoch": ts_epoch}]
+                            if not check_outage_gap(sub_hist_acc, max_gap):
+                                dt1_min = dt1_val / 60.0
+                                dt2_min = dt2_val / 60.0
+                                v_A_now = (score - ref1["score"]) / dt1_min
+                                v_A_prev = (ref1["score"] - ref2["score"]) / dt2_min
+                                raw_a = (v_A_now - v_A_prev) / dt1_min
 
-                v_score = round(dscore / dt_min, 4)
-                v_comment = round(dcomment / dt_min, 4)
+                                v_comm_A_now = (comments - ref1["comments"]) / dt1_min
+                                v_comm_A_prev = (ref1["comments"] - ref2["comments"]) / dt2_min
+                                raw_a_comm = (v_comm_A_now - v_comm_A_prev) / dt1_min
 
-                if (v_score_prev is not None and 
-                    dt_sec >= MIN_ACCELERATION_DT_SEC and 
-                    dt_prev is not None and dt_prev >= MIN_ACCELERATION_DT_SEC and 
-                    dscore >= MIN_ACCELERATION_DSCORE):
-
-                    raw_a = (v_score - v_score_prev) / dt_min
-                    if raw_a > ACCELERATION_CAP_THRESHOLD:
-                        a_score = ACCELERATION_CAP_THRESHOLD
-                        is_capped = 1
-                    else:
-                        a_score = round(raw_a, 6)
-                        is_capped = 0
-                    a_norm = round(a_score / max(score, 1), 6)
-
-                if (v_comment_prev is not None and 
-                    dt_sec >= MIN_ACCELERATION_DT_SEC and 
-                    dt_prev is not None and dt_prev >= MIN_ACCELERATION_DT_SEC and 
-                    dcomment >= 1):
-                    a_comment = round((v_comment - v_comment_prev) / dt_min, 6)
-
-                rank_score = round(v_score * math.log(1.0 + max(score, 0)), 4)
+                                if raw_a > ACCELERATION_CAP_THRESHOLD:
+                                    a_score = ACCELERATION_CAP_THRESHOLD
+                                    is_capped = 1
+                                elif raw_a < -ACCELERATION_CAP_THRESHOLD:
+                                    a_score = -ACCELERATION_CAP_THRESHOLD
+                                    is_capped = 1
+                                else:
+                                    a_score = round(raw_a, 6)
+                                    is_capped = 0
+                                a_norm = round(a_score / max(score, 1), 6)
+                                a_comment = round(raw_a_comm, 6)
 
         # Precomputed display dimensions
         raw_title = str(snap.get("title") or "").strip()
@@ -528,8 +606,9 @@ class StoryKinematicsTracker:
         link_target = url if url else f"https://news.ycombinator.com/item?id={post_id}"
         title_link = f'<a href="{link_target}" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: none; font-weight: 500;">{clean_title}</a>'
 
+        now_epoch = datetime.now(timezone.utc).timestamp()
         created_epoch = parse_timestamp_to_epoch(snap.get("created_at"))
-        diff_sec = max(0, ts_epoch - created_epoch) if (ts_epoch > 0 and created_epoch > 0) else 0
+        diff_sec = max(0, now_epoch - created_epoch) if created_epoch > 0 else 0
         if diff_sec < 3600:
             story_age = f"{int(round(diff_sec / 60.0))}m"
         elif diff_sec < 86400:
@@ -560,6 +639,7 @@ class StoryKinematicsTracker:
         snap["dt_sec"] = dt_sec
         snap["v_score"] = v_score
         snap["v_comment"] = v_comment
+        snap["v_score_30m"] = v_score_30m
         snap["a_score"] = a_score
         snap["a_comment"] = a_comment
         snap["a_norm"] = a_norm
@@ -572,17 +652,13 @@ class StoryKinematicsTracker:
         snap["observation_time_ist"] = observation_time_ist
         snap["quadrant"] = quadrant
 
-        # Never write cluster columns into story snapshot rows
         snap.pop("cluster_id", None)
         snap.pop("cluster_label", None)
 
         hist.append({
             "epoch": ts_epoch,
             "score": score,
-            "comments": comments,
-            "dt_sec": dt_sec,
-            "v_score": v_score,
-            "v_comment": v_comment
+            "comments": comments
         })
 
         return snap

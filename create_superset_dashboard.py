@@ -94,6 +94,65 @@ with app.app_context():
     else:
         print(f"Found physical dataset hn_snapshots (ID: {ds_physical.id})")
 
+    # 1a-2. Dedicated Virtual Dataset for Active Stories (Last 6h without adhoc subquery)
+    sql_active_stories = """
+SELECT
+    post_id,
+    author,
+    title,
+    score,
+    num_comments,
+    "__time"
+FROM "hn_snapshots"
+WHERE "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
+""".strip()
+
+    ds_active_stories = db.session.query(SqlaTable).filter_by(
+        database_id=druid_db.id, table_name="hn_active_stories_6h"
+    ).first()
+    if not ds_active_stories:
+        ds_active_stories = SqlaTable(
+            table_name="hn_active_stories_6h",
+            database_id=druid_db.id,
+            sql=sql_active_stories,
+            owners=[admin_user],
+            main_dttm_col="__time",
+        )
+        db.session.add(ds_active_stories)
+        db.session.flush()
+        print(f"Created virtual dataset hn_active_stories_6h (ID: {ds_active_stories.id})")
+    else:
+        ds_active_stories.sql = sql_active_stories
+        ds_active_stories.main_dttm_col = "__time"
+        print(f"Updated virtual dataset hn_active_stories_6h (ID: {ds_active_stories.id})")
+
+    # Explicitly ensure TableColumns are registered on ds_active_stories
+    active_stories_cols = [
+        ("post_id", "VARCHAR", False),
+        ("author", "VARCHAR", False),
+        ("title", "VARCHAR", False),
+        ("score", "BIGINT", False),
+        ("num_comments", "BIGINT", False),
+        ("__time", "TIMESTAMP", True),
+    ]
+    existing_as_cols = {c.column_name: c for c in db.session.query(TableColumn).filter_by(table_id=ds_active_stories.id).all()}
+    for cname, ctype, is_dttm in active_stories_cols:
+        if cname not in existing_as_cols:
+            col = TableColumn(
+                table_id=ds_active_stories.id,
+                column_name=cname,
+                type=ctype,
+                is_dttm=is_dttm,
+                filterable=True,
+                groupby=True
+            )
+            db.session.add(col)
+        else:
+            col = existing_as_cols[cname]
+            col.type = ctype
+            col.is_dttm = is_dttm
+    db.session.commit()
+
     # 1b. Macro 5-Minute Trend Virtual Dataset: hn_macro_velocity_5m
     sql_macro = """
 SELECT
@@ -307,9 +366,45 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
         db.session.add(ds_clusters)
         db.session.flush()
         print(f"Created virtual dataset hn_narrative_clusters (ID: {ds_clusters.id})")
+        print(f"Created virtual dataset hn_narrative_clusters (ID: {ds_clusters.id})")
     else:
         ds_clusters.sql = sql_clusters
         print(f"Updated virtual dataset hn_narrative_clusters (ID: {ds_clusters.id})")
+
+    # Explicitly ensure all TableColumns are registered on ds_clusters so no missing column errors occur
+    cluster_cols = [
+        ("cluster", "VARCHAR", False),
+        ("cluster_id", "VARCHAR", False),
+        ("top_title", "VARCHAR", False),
+        ("latest_activity_time", "TIMESTAMP", True),
+        ("number_of_stories", "BIGINT", False),
+        ("combined_score", "BIGINT", False),
+        ("combined_velocity", "DOUBLE", False),
+    ]
+    existing_cluster_cols = {c.column_name: c for c in db.session.query(TableColumn).filter_by(table_id=ds_clusters.id).all()}
+    for cname, ctype, is_dttm in cluster_cols:
+        if cname not in existing_cluster_cols:
+            col = TableColumn(
+                table_id=ds_clusters.id,
+                column_name=cname,
+                type=ctype,
+                is_dttm=is_dttm,
+                filterable=True,
+                groupby=True
+            )
+            db.session.add(col)
+        else:
+            col = existing_cluster_cols[cname]
+            col.type = ctype
+            col.is_dttm = is_dttm
+            col.filterable = True
+            col.groupby = True
+
+    # Ensure v_score_30m exists on physical dataset
+    existing_phys_cols = {c.column_name: c for c in db.session.query(TableColumn).filter_by(table_id=ds_physical.id).all()}
+    if "v_score_30m" not in existing_phys_cols:
+        col = TableColumn(table_id=ds_physical.id, column_name="v_score_30m", type="DOUBLE", filterable=True, groupby=True)
+        db.session.add(col)
 
     db.session.commit()
 
@@ -327,6 +422,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
         "comment_velocity_per_minute": "Comment Velocity (comm/min)",
         "v_score": "Velocity (pts/min)",
         "v_comment": "Comment Velocity (comm/min)",
+        "v_score_30m": "30-min Velocity (pts/min)",
         "score_acceleration": "Acceleration (pts/min²)",
         "comment_acceleration": "Comment Accel (comm/min²)",
         "a_score": "Acceleration (pts/min²)",
@@ -356,7 +452,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
         "dt_sec": "Lookback dt (s)"
     }
 
-    for ds in [ds_physical, ds_macro, ds_latest_eligible, ds_breakout, ds_history, ds_clusters]:
+    for ds in [ds_physical, ds_active_stories, ds_macro, ds_latest_eligible, ds_breakout, ds_history, ds_clusters]:
         cols = db.session.query(TableColumn).filter_by(table_id=ds.id).all()
         for col in cols:
             if col.column_name in column_labels:
@@ -368,31 +464,19 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
     # -------------------------------------------------------------------------
     kpi_slices = []
 
-    # KPI 1: Active Stories
+    # KPI 1: Active Stories (Plain COUNT(DISTINCT post_id) over last 6h virtual dataset)
     kpi1_name = "Active Stories"
     kpi1_params = {
-        "datasource": f"{ds_physical.id}__table",
-        "viz_type": "big_number",
+        "datasource": f"{ds_active_stories.id}__table",
+        "viz_type": "big_number_total",
         "metric": {
             "expressionType": "SQL",
             "sqlExpression": 'COUNT(DISTINCT post_id)',
             "label": "Active Stories"
         },
-        "adhoc_filters": [
-            {
-                "clause": "WHERE",
-                "expressionType": "SQL",
-                "sqlExpression": '"__time" >= (SELECT MAX("__time") - INTERVAL \'6\' HOUR FROM "hn_snapshots")',
-                "filterOptionName": "filter_last_6h"
-            }
-        ],
+        "adhoc_filters": [],
         "granularity_sqla": "__time",
-        "time_grain_sqla": "PT5M",
         "time_range": "No filter",
-        "compare_lag": 6,
-        "compare_suffix": "vs 30m ago",
-        "show_trend_line": True,
-        "start_y_axis_at_zero": True,
         "subheader": "Distinct stories tracked (last 6h)",
         "header_font_size": 0.65,
         "subheader_font_size": 0.24,
@@ -403,22 +487,23 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
     if not kpi1:
         kpi1 = Slice(
             slice_name=kpi1_name,
-            viz_type="big_number",
+            viz_type="big_number_total",
             datasource_type="table",
-            datasource_id=ds_physical.id,
+            datasource_id=ds_active_stories.id,
             params=json.dumps(kpi1_params),
             owners=[admin_user],
-            description="Active distinct stories tracked in the last 6 hours with 30-min comparison."
+            description="Active distinct stories tracked in the last 6 hours."
         )
         db.session.add(kpi1)
     else:
+        kpi1.viz_type = "big_number_total"
         kpi1.params = json.dumps(kpi1_params)
-        kpi1.datasource_id = ds_physical.id
+        kpi1.datasource_id = ds_active_stories.id
     db.session.flush()
     kpi_slices.append(kpi1)
     print(f"KPI 1 '{kpi1_name}' ready (ID: {kpi1.id})")
 
-    # KPI 2: Avg Velocity
+    # KPI 2: Avg Velocity (5-min velocity)
     kpi2_name = "Avg Velocity"
     kpi2_params = {
         "datasource": f"{ds_latest_eligible.id}__table",
@@ -443,7 +528,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
         "compare_suffix": "vs 30m ago",
         "show_trend_line": True,
         "start_y_axis_at_zero": True,
-        "subheader": "Mean score velocity (pts/min)",
+        "subheader": "Mean score velocity (5-min velocity, pts/min)",
         "header_font_size": 0.65,
         "subheader_font_size": 0.24,
         "y_axis_format": ".2f",
@@ -468,7 +553,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
     kpi_slices.append(kpi2)
     print(f"KPI 2 '{kpi2_name}' ready (ID: {kpi2.id})")
 
-    # KPI 3: Peak Velocity
+    # KPI 3: Peak Velocity (5-min velocity)
     kpi3_name = "Peak Velocity"
     kpi3_params = {
         "datasource": f"{ds_latest_eligible.id}__table",
@@ -493,7 +578,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
         "compare_suffix": "vs 30m ago",
         "show_trend_line": True,
         "start_y_axis_at_zero": True,
-        "subheader": "Fastest gaining story (pts/min)",
+        "subheader": "Fastest gaining story (5-min velocity, pts/min)",
         "header_font_size": 0.65,
         "subheader_font_size": 0.24,
         "y_axis_format": ".2f",
@@ -518,7 +603,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
     kpi_slices.append(kpi3)
     print(f"KPI 3 '{kpi3_name}' ready (ID: {kpi3.id})")
 
-    # KPI 4: Current Accel
+    # KPI 4: Current Accel (10-min acceleration)
     kpi4_name = "Current Accel"
     kpi4_params = {
         "datasource": f"{ds_breakout.id}__table",
@@ -543,7 +628,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
         "compare_suffix": "vs 30m ago",
         "show_trend_line": True,
         "start_y_axis_at_zero": True,
-        "subheader": "Latest breakout surge (pts/min²)",
+        "subheader": "Latest breakout surge (10-min acceleration, pts/min²)",
         "header_font_size": 0.65,
         "subheader_font_size": 0.24,
         "y_axis_format": ".4f",
@@ -568,17 +653,24 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
     kpi_slices.append(kpi4)
     print(f"KPI 4 '{kpi4_name}' ready (ID: {kpi4.id})")
 
-    # KPI 5: Peak Accel
+    # KPI 5: Peak Accel (Filtered strictly to 6h relative to now)
     kpi5_name = "Peak Accel"
     kpi5_params = {
         "datasource": f"{ds_physical.id}__table",
         "viz_type": "big_number",
         "metric": {
             "expressionType": "SQL",
-            "sqlExpression": "COALESCE(ROUND(LEAST(MAX(CASE WHEN a_score > 0 THEN a_score END), 50.0), 4), 0.0)",
+            "sqlExpression": "COALESCE(ROUND(MAX(CASE WHEN a_score > 0 THEN a_score END), 4), 0.0)",
             "label": "Peak Accel"
         },
-        "adhoc_filters": [],
+        "adhoc_filters": [
+            {
+                "clause": "WHERE",
+                "expressionType": "SQL",
+                "sqlExpression": '"__time" > TIME_SHIFT(CURRENT_TIMESTAMP, \'PT6H\', -1)',
+                "filterOptionName": "filter_peak_accel_6h"
+            }
+        ],
         "granularity_sqla": "__time",
         "time_grain_sqla": "PT5M",
         "time_range": "No filter",
@@ -586,7 +678,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
         "compare_suffix": "vs 30m ago",
         "show_trend_line": True,
         "start_y_axis_at_zero": True,
-        "subheader": "Max 6h surge rate (pts/min²)",
+        "subheader": "Max 6h surge rate (10-min acceleration, pts/min²)",
         "header_font_size": 0.65,
         "subheader_font_size": 0.24,
         "y_axis_format": ".4f",
@@ -803,7 +895,14 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
             "story_age",
             "observation_time_ist"
         ],
-        "adhoc_filters": [],
+        "adhoc_filters": [
+            {
+                "clause": "WHERE",
+                "expressionType": "SQL",
+                "sqlExpression": "score_velocity_per_minute > 0 OR comment_velocity_per_minute > 0",
+                "filterOptionName": "filter_growth_pos"
+            }
+        ],
         "order_by_cols": ['["weighted_velocity_rank", false]'],
         "row_limit": 500,
         "table_header_fixed": True,
@@ -813,6 +912,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
         "include_search": True,
         "page_size": 25,
         "server_page_length": 25,
+        "empty_state_text": "No stories gaining engagement in the latest poll",
         "column_config": {
             "title_link": {"columnWidth": 270},
             "author": {"columnWidth": 75},
@@ -973,6 +1073,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
         "include_search": True,
         "page_size": 15,
         "server_page_length": 15,
+        "empty_state_text": "No narrative clusters in the last 6h",
         "column_config": {
             "cluster": {"columnWidth": 260},
             "number_of_stories": {"columnWidth": 80},
@@ -1026,7 +1127,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
             "story_age"
         ],
         "order_by_cols": ['["__time", false]'],
-        "row_limit": 1000,
+        "row_limit": 10000,
         "table_header_fixed": True,
         "show_cell_bars": False,
         "align_pn": False,
@@ -1472,5 +1573,15 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
     })
 
     db.session.commit()
+
+    # Clear Superset cache so fresh data and queries reflect immediately
+    try:
+        from superset.extensions import cache_manager
+        cache_manager.data_cache.clear()
+        cache_manager.cache.clear()
+        print("[*] Successfully cleared Superset data and query caches.")
+    except Exception as e:
+        print(f"[WARN] Cache clearing: {e}")
+
     print(f"\n[SUCCESS] Dashboard '{dash.dashboard_title}' successfully provisioned with separated clusters and polished visuals!")
     print(f"Dashboard ID: {dash.id} | Slug: {dash.slug} | URL: /superset/dashboard/{dash.slug}/")

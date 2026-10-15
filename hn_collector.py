@@ -3,13 +3,13 @@
 InfoVelocity - Stage 1 & Snapshot Collector: Hacker News
 =========================================================
 Polls the Hacker News Firebase REST API:
-1. Discovers newly submitted stories and appends them to hn_events.jsonl (immutable catalog).
-2. Maintains an active pool of recent stories within a sliding time window.
-3. Periodically re-fetches engagement metrics for all active stories and writes
-   timestamped observations to hn_snapshots.jsonl for velocity & acceleration tracking.
-4. Pre-computes kinematics and automatically syncs to Apache Druid continuously.
-5. Emits heartbeats on every polling cycle for service liveness monitoring.
-6. Explicit isolated demo mode via --demo flag targeting hn_snapshots_sim (never mixing with real data).
+1. Discovers stories from /v0/newstories, /v0/topstories, and /v0/beststories.
+2. Tracks up to ~300 stories posted in the last 24h (type == 'story', not deleted, not dead, non-empty title).
+3. Drops stories older than 24h from the active pool (keeping history in files).
+4. Emits structured per-cycle logs: pool size, new stories added, stories dropped.
+5. Emits structured heartbeats on every polling cycle for service liveness monitoring.
+6. Automatically pre-computes kinematics and syncs snapshots & clusters to Apache Druid.
+7. Isolated demo mode via --demo flag targeting hn_snapshots_sim (never mixing with real data).
 """
 
 import os
@@ -22,6 +22,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from dotenv import load_dotenv
 
@@ -99,104 +100,6 @@ def sync_to_druid(data_file: str, spec_file: str, datasource_name: str) -> bool:
         return False
 
 
-def load_seen_ids_and_active_pool(events_file: str, active_window_hours: int = 12, active_limit: int = 100) -> tuple[set, OrderedDict]:
-    """Reads existing events catalog to populate seen_ids and seed active_pool."""
-    seen = set()
-    active_pool = OrderedDict()
-    events_path = Path(events_file)
-    if not events_path.exists():
-        return seen, active_pool
-
-    now_epoch = datetime.now(timezone.utc).timestamp()
-    cutoff_epoch = now_epoch - (active_window_hours * 3600)
-
-    try:
-        with open(events_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    post_id = str(data.get("post_id", ""))
-                    if not post_id:
-                        continue
-                    seen.add(post_id)
-
-                    ts_str = data.get("created_at") or data.get("timestamp")
-                    if ts_str:
-                        try:
-                            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                            story_epoch = dt.timestamp()
-                            if story_epoch >= cutoff_epoch:
-                                active_pool[post_id] = story_epoch
-                        except ValueError:
-                            pass
-                except json.JSONDecodeError:
-                    continue
-
-        if len(active_pool) > active_limit:
-            excess = len(active_pool) - active_limit
-            for _ in range(excess):
-                active_pool.popitem(last=False)
-
-        logger.info(f"Loaded {len(seen)} existing post IDs from {events_file} for catalog deduplication.")
-        logger.info(f"Seeded active pool with {len(active_pool)} recent stories within {active_window_hours}h window.")
-    except Exception as e:
-        logger.warning(f"Could not read existing events file: {e}")
-
-    return seen, active_pool
-
-
-def fetch_new_story_ids(limit: int = 25, timeout: int = 10) -> list:
-    """Fetches active trending and latest story IDs from Hacker News API."""
-    story_ids = []
-    try:
-        r_top = requests.get(f"{HN_BASE_URL}/topstories.json", timeout=timeout)
-        if r_top.ok and isinstance(r_top.json(), list):
-            story_ids.extend(r_top.json()[:limit])
-    except Exception as e:
-        logger.warning(f"Failed to fetch top stories: {e}")
-
-    try:
-        r_new = requests.get(f"{HN_BASE_URL}/newstories.json", timeout=timeout)
-        if r_new.ok and isinstance(r_new.json(), list):
-            for pid in r_new.json()[:limit]:
-                if pid not in story_ids:
-                    story_ids.append(pid)
-    except Exception as e:
-        logger.warning(f"Failed to fetch new stories: {e}")
-
-    return story_ids[:limit]
-
-
-def fetch_item_details(item_id: str | int, timeout: int = 10) -> dict | None:
-    """Fetches details for a specific item from Hacker News API."""
-    url = f"{HN_BASE_URL}/item/{item_id}.json"
-    try:
-        response = requests.get(url, timeout=timeout)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logger.debug(f"Failed to fetch item {item_id}: {e}")
-        return None
-
-
-def prune_active_pool(active_pool: OrderedDict, active_window_hours: int = 12, active_limit: int = 100) -> int:
-    """Removes expired stories and enforces maximum capacity on the active pool."""
-    now_epoch = datetime.now(timezone.utc).timestamp()
-    cutoff_epoch = now_epoch - (active_window_hours * 3600)
-
-    expired_ids = [pid for pid, created_epoch in active_pool.items() if created_epoch < cutoff_epoch]
-    for pid in expired_ids:
-        del active_pool[pid]
-
-    while len(active_pool) > active_limit:
-        active_pool.popitem(last=False)
-
-    return len(expired_ids)
-
-
 def is_valid_story(item_data: dict | None) -> bool:
     """Only keep items where type == 'story', not deleted, not dead, and title is non-empty."""
     if not item_data or not isinstance(item_data, dict):
@@ -211,63 +114,234 @@ def is_valid_story(item_data: dict | None) -> bool:
     return True
 
 
+def fetch_candidate_story_ids(limit_per_endpoint: int = 150, timeout: int = 10) -> list[int]:
+    """
+    Fetches candidate story IDs from /v0/topstories, /v0/newstories, and /v0/beststories.
+    Combines and deduplicates while preserving freshness and prominence.
+    """
+    endpoints = ["topstories.json", "newstories.json", "beststories.json"]
+    ordered_ids = []
+    seen = set()
+
+    for ep in endpoints:
+        url = f"{HN_BASE_URL}/{ep}"
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.ok and isinstance(r.json(), list):
+                data = r.json()
+                for item_id in data[:limit_per_endpoint]:
+                    if item_id not in seen:
+                        seen.add(item_id)
+                        ordered_ids.append(item_id)
+        except Exception as e:
+            logger.warning(f"Failed to fetch {ep}: {e}")
+
+    return ordered_ids
+
+
+def fetch_single_item(session: requests.Session, item_id: int | str, timeout: int = 10) -> tuple[str, dict | None]:
+    """Fetches details for a single item using requests Session."""
+    url = f"{HN_BASE_URL}/item/{item_id}.json"
+    str_id = str(item_id)
+    try:
+        r = session.get(url, timeout=timeout)
+        if r.ok and r.json():
+            return str_id, r.json()
+    except Exception:
+        pass
+    return str_id, None
+
+
+def fetch_items_concurrent(item_ids: list[int | str], max_workers: int = 25, timeout: int = 10) -> dict[str, dict]:
+    """Fetches item details concurrently in parallel threads."""
+    results = {}
+    if not item_ids:
+        return results
+
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=max_workers, pool_maxsize=max_workers, max_retries=2)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(fetch_single_item, session, item_id, timeout) for item_id in item_ids]
+            for fut in as_completed(futures):
+                str_id, data = fut.result()
+                if data:
+                    results[str_id] = data
+    finally:
+        session.close()
+
+    return results
+
+
+def load_seen_ids_and_active_pool(
+    events_file: str,
+    snapshots_file: str,
+    active_window_hours: int = 24,
+    active_limit: int = 300
+) -> tuple[set, OrderedDict]:
+    """Reads existing catalog and snapshots to populate seen_ids and seed active_pool with stories < 24h old."""
+    seen = set()
+    active_pool = OrderedDict()
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    cutoff_epoch = now_epoch - (active_window_hours * 3600)
+
+    # 1. Load seen catalog IDs
+    events_path = Path(events_file)
+    if events_path.exists():
+        try:
+            with open(events_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        post_id = str(data.get("post_id", ""))
+                        if post_id:
+                            seen.add(post_id)
+                            ts_str = data.get("created_at") or data.get("timestamp")
+                            if ts_str:
+                                try:
+                                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                                    story_epoch = dt.timestamp()
+                                    if story_epoch >= cutoff_epoch:
+                                        active_pool[post_id] = story_epoch
+                                except ValueError:
+                                    pass
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            logger.warning(f"Could not read events file: {e}")
+
+    # 2. Check snapshots for recently observed stories within 24h
+    snaps_path = Path(snapshots_file)
+    if snaps_path.exists():
+        try:
+            with open(snaps_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        post_id = str(data.get("post_id", ""))
+                        if post_id:
+                            seen.add(post_id)
+                            ts_str = data.get("created_at")
+                            if ts_str:
+                                try:
+                                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                                    story_epoch = dt.timestamp()
+                                    if story_epoch >= cutoff_epoch:
+                                        active_pool[post_id] = story_epoch
+                                except ValueError:
+                                    pass
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            logger.warning(f"Could not read snapshots file: {e}")
+
+    # Prune to active_limit
+    while len(active_pool) > active_limit:
+        active_pool.popitem(last=False)
+
+    logger.info(f"Loaded {len(seen)} existing post IDs for catalog deduplication.")
+    logger.info(f"Seeded active pool with {len(active_pool)} recent stories within {active_window_hours}h window.")
+    return seen, active_pool
+
+
 def poll_cycle_live(
     events_file: str,
     snapshots_file: str,
     seen_ids: set,
     active_pool: OrderedDict,
-    posts_per_poll: int = 25,
-    active_window_hours: int = 12,
-    active_limit: int = 100,
-    kinematics_tracker: StoryKinematicsTracker = None,
+    active_window_hours: int = 24,
+    active_limit: int = 300,
     poll_interval: int = 60,
     auto_sync: bool = True,
     is_demo: bool = False
 ) -> tuple[int, int]:
-    """Executes a dual-phase polling cycle with heartbeat and automatic continuous Druid sync."""
+    """
+    Executes a single polling cycle:
+    1. Prunes stories older than 24h from active pool.
+    2. Fetches candidate stories from /v0/newstories, /v0/topstories, /v0/beststories.
+    3. Fills active pool up to ~300 stories posted in the last 24h.
+    4. Logs pool size, new stories added, stories dropped.
+    5. Polls engagement metrics for all active stories and writes snapshots.
+    6. Recomputes kinematics on snapshots and outputs hn_clusters.jsonl.
+    7. Continuously syncs snapshots and clusters to Apache Druid.
+    8. Emits heartbeat log.
+    """
     now_dt = datetime.now(timezone.utc)
     current_snapshot_ts = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     now_epoch = now_dt.timestamp()
+    cutoff_epoch = now_epoch - (active_window_hours * 3600)
 
-    # --- Phase 1: Discovery ---
-    logger.info(f"[Discovery] Fetching newest story IDs (limit={posts_per_poll})...")
-    candidate_ids = fetch_new_story_ids(limit=posts_per_poll)
+    stories_dropped = 0
+    new_stories_added = 0
+
+    # --- Phase 1: Prune stories older than 24h from active tracking ---
+    expired_ids = [pid for pid, created_epoch in active_pool.items() if created_epoch < cutoff_epoch]
+    for pid in expired_ids:
+        del active_pool[pid]
+        stories_dropped += 1
+
+    # --- Phase 2: Candidate Discovery from new, top, best ---
+    needed = active_limit - len(active_pool)
     new_catalog_events = []
 
-    for item_id in candidate_ids:
-        str_id = str(item_id)
-        if str_id in seen_ids:
-            if str_id not in active_pool:
-                active_pool[str_id] = now_epoch
-            continue
+    # Fetch candidate IDs from newstories, topstories, and beststories
+    candidate_ids = fetch_candidate_story_ids(limit_per_endpoint=150)
+    untracked_candidates = [cid for cid in candidate_ids if str(cid) not in active_pool]
 
-        item_data = fetch_item_details(item_id)
-        if not is_valid_story(item_data):
-            seen_ids.add(str_id)
-            continue
+    if untracked_candidates:
+        # Fetch batch of candidates to fill pool
+        batch_to_fetch = untracked_candidates[:max(needed * 2, 60)]
+        fetched_items = fetch_items_concurrent(batch_to_fetch, max_workers=25)
 
-        created_epoch = item_data.get("time") or now_epoch
-        created_iso = format_iso_timestamp(created_epoch)
-        post_url = item_data.get("url") or f"https://news.ycombinator.com/item?id={str_id}"
-        clean_title = fix_mojibake(str(item_data.get("title") or "").strip())
+        for item_id in batch_to_fetch:
+            if len(active_pool) >= active_limit:
+                break
+            str_id = str(item_id)
+            item_data = fetched_items.get(str_id)
+            if not is_valid_story(item_data):
+                seen_ids.add(str_id)
+                continue
 
-        catalog_record = {
-            "post_id": str_id,
-            "timestamp": created_iso,
-            "created_at": created_iso,
-            "title": clean_title,
-            "body": str(item_data.get("text") or ""),
-            "author": str(item_data.get("by") or "[deleted]"),
-            "source": "hackernews",
-            "subreddit": "hackernews",
-            "url": str(post_url),
-            "score": int(item_data.get("score") or 0),
-            "num_comments": int(item_data.get("descendants") or 0)
-        }
-        new_catalog_events.append(catalog_record)
-        seen_ids.add(str_id)
-        active_pool[str_id] = created_epoch
+            created_epoch = item_data.get("time") or now_epoch
+            if created_epoch < cutoff_epoch:
+                seen_ids.add(str_id)
+                continue
 
+            # Story is valid and < 24h old
+            created_iso = format_iso_timestamp(created_epoch)
+            clean_title = fix_mojibake(str(item_data.get("title") or "").strip())
+            post_url = item_data.get("url") or f"https://news.ycombinator.com/item?id={str_id}"
+
+            active_pool[str_id] = created_epoch
+
+            if str_id not in seen_ids:
+                seen_ids.add(str_id)
+                new_stories_added += 1
+                catalog_record = {
+                    "post_id": str_id,
+                    "timestamp": created_iso,
+                    "created_at": created_iso,
+                    "title": clean_title,
+                    "body": str(item_data.get("text") or ""),
+                    "author": str(item_data.get("by") or "[deleted]"),
+                    "source": "hackernews",
+                    "subreddit": "hackernews",
+                    "url": str(post_url),
+                    "score": int(item_data.get("score") or 0),
+                    "num_comments": int(item_data.get("descendants") or 0)
+                }
+                new_catalog_events.append(catalog_record)
+
+    # Persist newly cataloged stories
     if new_catalog_events and not is_demo:
         try:
             with open(events_file, "a", encoding="utf-8") as f:
@@ -277,26 +351,36 @@ def poll_cycle_live(
         except IOError as e:
             logger.error(f"Failed to write to {events_file}: {e}")
 
-    # --- Prune Active Pool ---
-    pruned_count = prune_active_pool(active_pool, active_window_hours, active_limit)
-    if pruned_count > 0:
-        logger.info(f"[Active Pool] Pruned {pruned_count} expired stories from active tracking.")
+    # Log pool size, new stories added, stories dropped
+    logger.info(
+        f"[Active Pool] Pool size: {len(active_pool)} | "
+        f"New stories added: {new_stories_added} | "
+        f"Stories dropped: {stories_dropped}"
+    )
 
-    logger.info(f"[Snapshot] Polling engagement for {len(active_pool)} active stories...")
+    # --- Phase 3: Engagement Snapshot Collection ---
+    active_ids = list(active_pool.keys())
+    active_item_data = fetch_items_concurrent(active_ids, max_workers=25)
 
-    # --- Phase 2: Snapshots ---
     snapshots = []
-    for str_id in list(active_pool.keys()):
-        item_data = fetch_item_details(str_id)
+    for str_id in active_ids:
+        item_data = active_item_data.get(str_id)
         if not is_valid_story(item_data):
             if str_id in active_pool:
                 del active_pool[str_id]
+                stories_dropped += 1
             continue
 
         created_epoch = item_data.get("time") or active_pool.get(str_id, now_epoch)
+        if created_epoch < cutoff_epoch:
+            if str_id in active_pool:
+                del active_pool[str_id]
+                stories_dropped += 1
+            continue
+
         created_iso = format_iso_timestamp(created_epoch)
-        post_url = item_data.get("url") or f"https://news.ycombinator.com/item?id={str_id}"
         clean_title = fix_mojibake(str(item_data.get("title") or "").strip())
+        post_url = item_data.get("url") or f"https://news.ycombinator.com/item?id={str_id}"
 
         snapshot_record = {
             "post_id": str_id,
@@ -310,8 +394,6 @@ def poll_cycle_live(
             "score": int(item_data.get("score") or 0),
             "num_comments": int(item_data.get("descendants") or 0)
         }
-        if kinematics_tracker:
-            kinematics_tracker.process_snapshot(snapshot_record)
         snapshots.append(snapshot_record)
 
     if snapshots:
@@ -319,28 +401,27 @@ def poll_cycle_live(
             with open(snapshots_file, "a", encoding="utf-8") as f:
                 for snap in snapshots:
                     f.write(json.dumps(snap, ensure_ascii=False) + "\n")
-            logger.info(f"[Snapshot] Saved {len(snapshots)} engagement snapshots to {snapshots_file} (ts={current_snapshot_ts}).")
+            logger.info(f"[Snapshot] Recorded {len(snapshots)} engagement snapshots -> {snapshots_file} (ts={current_snapshot_ts}).")
 
-            # Recompute kinematics & separate clusters dataset
+            # Pre-compute kinematics across all snapshots and generate narrative clusters
             compute_file_kinematics(snapshots_file, poll_interval=poll_interval)
 
-            # Continuous sync to Druid
+            # Auto-sync to Druid
             if auto_sync:
                 ds_name = "hn_snapshots_sim" if is_demo else "hn_snapshots"
                 spec_name = "druid_snapshots_sim_ingestion_spec.json" if is_demo else "druid_snapshots_ingestion_spec.json"
                 sync_to_druid(snapshots_file, spec_name, ds_name)
 
-                # Also sync clusters if live
                 if not is_demo and os.path.exists("hn_clusters.jsonl"):
                     sync_to_druid("hn_clusters.jsonl", "druid_clusters_ingestion_spec.json", "hn_clusters")
 
         except IOError as e:
             logger.error(f"Failed to write to {snapshots_file}: {e}")
 
-    # Emit Heartbeat
+    # Emit Heartbeat log
     logger.info(f"[HEARTBEAT] Collector active | Polled at {current_snapshot_ts} | Pool: {len(active_pool)} stories | Status: HEALTHY | Mode: {'DEMO/SIM' if is_demo else 'LIVE'}")
 
-    return len(new_catalog_events), len(snapshots)
+    return new_stories_added, len(snapshots)
 
 
 def main():
@@ -365,23 +446,15 @@ def main():
         help="Interval in seconds between polling cycles."
     )
     parser.add_argument(
-        "--limit",
-        "--posts-per-poll",
-        dest="limit",
-        type=int,
-        default=int(os.getenv("POSTS_PER_POLL", "25")),
-        help="Maximum newest stories to discover per cycle."
-    )
-    parser.add_argument(
         "--active-limit",
         type=int,
-        default=int(os.getenv("ACTIVE_STORY_LIMIT", "100")),
-        help="Maximum active stories to track for engagement snapshots."
+        default=int(os.getenv("ACTIVE_STORY_LIMIT", "300")),
+        help="Maximum active stories to track for engagement snapshots (up to ~300)."
     )
     parser.add_argument(
         "--active-window-hours",
         type=int,
-        default=int(os.getenv("ACTIVE_WINDOW_HOURS", "12")),
+        default=int(os.getenv("ACTIVE_WINDOW_HOURS", "24")),
         help="Active story window in hours before a story stops being snapshot."
     )
     parser.add_argument(
@@ -417,18 +490,17 @@ def main():
     logger.info(f"Snapshots File       : {snapshots_file}")
     logger.info(f"Polling Interval     : {args.interval} seconds")
     logger.info(f"Active Story Limit   : {args.active_limit}")
+    logger.info(f"Active Window        : {args.active_window_hours} hours")
     logger.info(f"Mode                 : {mode_label}")
     logger.info(f"Auto Druid Sync      : {'Disabled' if args.no_sync else 'Continuous'}")
     logger.info("=================================================================")
 
     seen_ids, active_pool = load_seen_ids_and_active_pool(
         args.output,
+        snapshots_file,
         active_window_hours=args.active_window_hours,
         active_limit=args.active_limit
     )
-
-    kinematics_tracker = StoryKinematicsTracker(poll_interval=args.interval)
-    kinematics_tracker.seed_from_file(snapshots_file)
 
     cycle_count = 0
     total_new_events = 0
@@ -444,10 +516,8 @@ def main():
                 snapshots_file,
                 seen_ids,
                 active_pool,
-                posts_per_poll=args.limit,
                 active_window_hours=args.active_window_hours,
                 active_limit=args.active_limit,
-                kinematics_tracker=kinematics_tracker,
                 poll_interval=args.interval,
                 auto_sync=not args.no_sync,
                 is_demo=args.demo

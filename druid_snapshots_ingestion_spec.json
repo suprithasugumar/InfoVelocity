@@ -34,6 +34,10 @@
           },
           {
             "type": "double",
+            "name": "v_score_30m"
+          },
+          {
+            "type": "double",
             "name": "a_score"
           },
           {
