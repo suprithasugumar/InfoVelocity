@@ -1127,7 +1127,7 @@ GROUP BY cluster, cluster_id, top_title, latest_activity_time
             "story_age"
         ],
         "order_by_cols": ['["__time", false]'],
-        "row_limit": 10000,
+        "row_limit": 100000,
         "table_header_fixed": True,
         "show_cell_bars": False,
         "align_pn": False,
