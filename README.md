@@ -448,14 +448,17 @@ The **InfoVelocity** dashboard translates physics-based kinematics into real-tim
 
 ### 3. Ranked Data Tables & Audit Logs
 - **Fastest Growing Narratives (Leaderboard)**:
-  - Ranked by weighted velocity rank ($\text{rank\_score} = v_{\text{score}} \cdot \ln(1 + \text{score})$), which balances high velocity against total community validation.
+  - Ranked by weighted velocity rank ($\text{rank\_score} = v_{\text{score}} \cdot \ln(1 + \text{score})$), balancing high velocity against total community validation.
   - Features clickable story titles linking directly to the source article (or HN thread fallback).
-  - Post IDs are hidden to maximize screen space; headers are frozen for seamless scrolling.
+  - Column widths tailored for 1080p with zero horizontal scrolling; row limit 200 without yellow warning.
 - **Breakout Monitor — Positive Acceleration**:
   - Filtered exclusively for narratives with $a_{\text{score}} > 0$ and ranked by normalized acceleration ($a_{\text{norm}} = a / \text{score}$).
-  - Cell backgrounds are conditionally formatted with rich green highlights for acceleration surges.
+  - Cell backgrounds are conditionally formatted with green highlights for acceleration surges; row limit 100.
+- **Narrative Clusters (Semantic Topic & Domain Aggregation)**:
+  - Groups stories published in the last 6 hours by semantic topics (e.g., AI/LLMs, Cybersecurity, Systems, Programming Languages) and shared domains.
+  - Summarizes story counts, combined scores, and combined velocities to identify broader macroeconomic attention shifts.
 - **Story Engagement Over Time (Full Trajectory Audit)**:
-  - Comprehensive snapshot log sorted latest-first (**Observation Time DESC**) displaying local IST timestamps with relative age (e.g., `22:41:46 (2m ago)`) and story publication age (e.g., `1.5h`).
+  - Comprehensive snapshot log sorted latest-first (**Observation Time DESC**) with relative publication age (e.g., `1.5h`) and local IST time (`15:31:44`).
   - Native filters on **Story Title** and **Post ID** allow users to isolate and trace the complete historical trajectory of any given story across consecutive observation rounds.
 
 ---
@@ -464,15 +467,15 @@ The **InfoVelocity** dashboard translates physics-based kinematics into real-tim
 
 When reviewing or presenting the dashboard UI at 1080p resolution, verify the following elements:
 
-- [ ] **Header Emojis & Badges**: All emojis (`⚡ 🔴 ⏱️ 📡`) render cleanly in UTF-8 without question mark (`???`) artifacts.
-- [ ] **Disclaimer Banner**: Expandable epistemic notice (`Velocity ≠ Veracity`) with details dropdown.
-- [ ] **5 KPI Cards**: Row 1 contains 5 cards aligned with equal heights (Active Stories, Avg Velocity, Peak Velocity, Current Top Accel, Peak Accel (6h)).
-- [ ] **Sparkline Trendlines**: Active Stories and Velocity cards display mini trendlines without errors.
-- [ ] **Macro Trend**: ECharts time-series line chart plots 5-minute velocity moving windows without negative dips.
-- [ ] **Momentum Map**: Bubble chart plots stories across 4 quadrants with legend color coding and bubble size scaling with score.
-- [ ] **Leaderboard Table**: Clickable title links, hidden Post ID, frozen header, no horizontal scrolling needed at 1080p, row limit 100 (no yellow warning).
+- [ ] **Header Emojis & Badges**: Clean UTF-8 rendering (`⚡` next to InfoVelocity title; badges `🔴 LIVE`, `⏱️ 10s REFRESH`, `📡 HACKER NEWS API` in order).
+- [ ] **Disclaimer Banner**: Prefixed with `⚠️` only (`⚠️ VELOCITY ≠ VERACITY`) with expandable details dropdown.
+- [ ] **5 KPI Cards**: Row 1 contains 5 cards with single-line titles, large font (~48px), readable subtitles, equal heights, and delta vs 30m ago.
+- [ ] **Macro Trend**: ECharts time-series line chart plots 5-minute velocity moving windows in UTC without negative dips.
+- [ ] **Momentum Map**: Bubble chart plots stories across 4 quadrants with sqrt(score) scaling, min/max bubble sizing, and opacity to prevent point occlusion.
+- [ ] **Leaderboard Table**: Clickable title links, narrowed columns, no horizontal scrolling needed at 1080p, row limit 200 (no yellow warning).
 - [ ] **Breakout Monitor**: Displays positive surges with green conditional formatting, row limit 100 (no yellow warning).
-- [ ] **Audit Table**: Chronologically sorted Observation Time DESC, relative timestamps (`2m ago`), story age (`1.2h`), row limit 500 (no yellow warning).
+- [ ] **Narrative Clusters Table**: Displays semantic clusters, story counts, combined scores, and combined velocities.
+- [ ] **Audit Table**: Chronologically sorted Observation Time DESC, precomputed display dimensions, row limit 500 (no yellow warning).
 - [ ] **Native Filter Panel**: Left filter panel includes Time Window, Min Score, Author, Story Title, and Post ID.
 - [ ] **Zero Data Errors**: All charts return HTTP 200 with zero planning/SQL errors.
 

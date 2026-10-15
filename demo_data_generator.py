@@ -178,6 +178,9 @@ def generate_demo_dataset(base_time: datetime = None, step_minutes: int = 5, out
             }
             snapshots_records.append(snapshot_record)
 
+    from compute_kinematics import process_snapshots_data
+    snapshots_records = process_snapshots_data(snapshots_records, poll_interval=step_minutes * 60)
+
     # Write events JSONL
     with open(events_file, "w", encoding="utf-8") as f:
         for r in events_records:
@@ -208,7 +211,23 @@ def generate_demo_dataset(base_time: datetime = None, step_minutes: int = 5, out
                         "subreddit",
                         "title",
                         "url",
-                        "created_at"
+                        "created_at",
+                        "title_link",
+                        "story_age",
+                        "observation_time_ist",
+                        "quadrant",
+                        "cluster_id",
+                        "cluster_label",
+                        {"type": "double", "name": "dt_sec"},
+                        {"type": "double", "name": "v_score"},
+                        {"type": "double", "name": "v_comment"},
+                        {"type": "double", "name": "a_score"},
+                        {"type": "double", "name": "a_comment"},
+                        {"type": "double", "name": "a_norm"},
+                        {"type": "double", "name": "rank_score"},
+                        {"type": "long", "name": "eligible"},
+                        {"type": "long", "name": "latest_flag"},
+                        {"type": "long", "name": "is_capped"}
                     ]
                 },
                 "metricsSpec": [

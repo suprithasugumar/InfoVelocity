@@ -4,23 +4,29 @@
 -- Target UI: Apache Superset Dashboards & Real-Time Alerts
 -- Time Column: "__time" (Ingestion snapshot observation timestamp)
 -- ============================================================================
--- Physical Kinematics (Pre-computed in Python pipeline before Druid ingestion):
---   - dt_sec     : Elapsed seconds between consecutive snapshots (min dt 20s, max 3*poll)
---   - v_score    : Score velocity in points / minute
---   - v_comment  : Comment velocity in comments / minute
---   - a_score    : Score acceleration in points / minute²
---   - a_comment  : Comment acceleration in comments / minute²
---   - a_norm     : Normalized score acceleration (a_score / max(score, 1))
---   - rank_score : Noise-penalized velocity rank (v_score * ln(1 + score))
---   - eligible   : 1 if (score >= 2 or comments >= 1) else 0
---   - latest_flag: 1 for latest snapshot per post_id, 0 for history
+-- Precomputed Dimensions (Calculated in Python pipeline before Druid ingestion):
+--   - dt_sec               : Elapsed seconds between consecutive snapshots
+--   - v_score              : Score velocity in points / minute
+--   - v_comment            : Comment velocity in comments / minute
+--   - a_score              : Score acceleration in points / minute²
+--   - a_comment            : Comment acceleration in comments / minute²
+--   - a_norm               : Normalized score acceleration (a_score / max(score, 1))
+--   - rank_score           : Noise-penalized velocity rank (v_score * ln(1 + score))
+--   - eligible             : 1 if (score >= 2 or comments >= 1) else 0
+--   - latest_flag          : 1 for latest snapshot per post_id, 0 for history
+--   - title_link           : Clickable HTML story title (<a href="..." target="_blank">)
+--   - story_age            : Human-readable publication age ('45m', '1.5h', '2.0d')
+--   - observation_time_ist : Observation time formatted in IST ('15:43:08')
+--   - quadrant             : 4-quadrant momentum classification string
+--   - cluster_id           : Narrative cluster identifier ('cluster_ai', 'cluster_security')
+--   - cluster_label        : Narrative cluster display label ('AI & Large Language Models')
 -- ============================================================================
 
 
 -- ----------------------------------------------------------------------------
 -- QUERY 1: Active Stories (KPI 1)
 -- ----------------------------------------------------------------------------
--- Superset Viz: Big Number with Trendline (5m buckets, last 6 hours)
+-- Superset Viz: Big Number with 30-min comparison (5m buckets, last 6 hours)
 
 SELECT 
     COUNT(DISTINCT post_id) AS active_stories
@@ -31,7 +37,7 @@ WHERE "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
 -- ----------------------------------------------------------------------------
 -- QUERY 2: Average & Highest Velocity (KPIs 2 & 3)
 -- ----------------------------------------------------------------------------
--- Superset Viz: Big Number with Trendline (last 6 hours, active eligible stories)
+-- Superset Viz: Big Number with 30-min comparison (active eligible stories)
 
 SELECT
     COALESCE(ROUND(AVG(v_score), 2), 0.0) AS avg_score_velocity,
@@ -45,7 +51,7 @@ WHERE latest_flag = 1
 -- ----------------------------------------------------------------------------
 -- QUERY 3: Current Top Acceleration vs Peak Acceleration (last 6h) (KPIs 4 & 5)
 -- ----------------------------------------------------------------------------
--- Superset Viz: Big Number Total
+-- Superset Viz: Big Number with 30-min comparison
 
 -- Current Top Acceleration (from latest snapshots):
 SELECT 
@@ -86,7 +92,7 @@ ORDER BY bucket_time ASC;
 -- ----------------------------------------------------------------------------
 -- QUERY 5: Momentum Map (Kinematic 4-Quadrant Scatter / Bubble Chart)
 -- ----------------------------------------------------------------------------
--- Superset Viz: bubble_v2 (x = v_score, y = a_score, size = score, series = quadrant)
+-- Superset Viz: bubble_v2 (x = v_score, y = a_score, size = sqrt(score), series = quadrant)
 
 SELECT 
     title,
@@ -94,7 +100,7 @@ SELECT
     quadrant,
     AVG(score_velocity_per_minute) AS x_velocity,
     AVG(score_acceleration) AS y_acceleration,
-    MAX(current_score) AS bubble_size
+    ROUND(SQRT(GREATEST(MAX(current_score), 1)), 2) AS bubble_size_sqrt
 FROM (
     SELECT
         post_id,
@@ -103,69 +109,55 @@ FROM (
         score AS current_score,
         COALESCE(ROUND(v_score, 2), 0.0) AS score_velocity_per_minute,
         COALESCE(ROUND(a_score, 4), 0.0) AS score_acceleration,
-        CASE 
-            WHEN v_score > 0 AND a_score > 0 THEN 'Breakout (Accelerating)'
-            WHEN v_score > 0 AND a_score < 0 THEN 'Cooling (Slowing)'
-            WHEN v_score > 0 AND (a_score = 0 OR a_score IS NULL) THEN 'Steady (Linear Growth)'
-            ELSE 'Fading / Dormant'
-        END AS quadrant
+        quadrant
     FROM "hn_snapshots"
     WHERE latest_flag = 1 
       AND eligible = 1
-    GROUP BY post_id, title, author, score, v_score, a_score
+    GROUP BY post_id, title, author, score, v_score, a_score, quadrant
 ) sub
 GROUP BY title, author, quadrant
 ORDER BY x_velocity DESC
-LIMIT 100;
+LIMIT 200;
 
 
 -- ----------------------------------------------------------------------------
 -- QUERY 6: Real-Time Narrative Leaderboard (Fastest Growing Stories)
 -- ----------------------------------------------------------------------------
--- Superset Viz: Table (Top 100, ranked by weighted rank_score)
+-- Superset Viz: Table (Top 200, ranked by weighted rank_score DESC)
 
 SELECT
-    '<a href="' || 
-    CASE 
-        WHEN url IS NOT NULL AND url != '' THEN url 
-        ELSE 'https://news.ycombinator.com/item?id=' || post_id 
-    END || 
-    '" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: none; font-weight: 500;">' || 
-    title || 
-    '</a>' AS title_link,
+    title_link,
     author,
-    score AS current_score,
-    num_comments AS current_comments,
-    COALESCE(ROUND(v_score, 2), 0.0) AS score_velocity_per_minute,
-    COALESCE(ROUND(v_comment, 2), 0.0) AS comment_velocity_per_minute,
-    COALESCE(ROUND(a_score, 4), 0.0) AS score_acceleration,
-    COALESCE(ROUND(rank_score, 4), 0.0) AS weighted_velocity_rank,
-    CASE 
-        WHEN (EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) < 3600 
-            THEN CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) / 60.0) AS VARCHAR), 'm')
-        WHEN (EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) < 86400 
-            THEN CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) / 3600.0, 1) AS VARCHAR), 'h')
-        ELSE CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) / 86400.0, 1) AS VARCHAR), 'd')
-    END AS story_age,
-    CONCAT(
-        TIME_FORMAT("__time", 'HH:mm:ss', 'Asia/Kolkata'),
-        ' (',
-        CASE 
-            WHEN (EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) < 60 
-                THEN 'just now'
-            WHEN (EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) < 3600 
-                THEN CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) / 60.0) AS VARCHAR), 'm ago')
-            ELSE 
-                CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) / 3600.0, 1) AS VARCHAR), 'h ago')
-        END,
-        ')'
-    ) AS observation_time_ist
-FROM "hn_snapshots"
-WHERE latest_flag = 1 
-  AND eligible = 1
-GROUP BY post_id, title, author, score, num_comments, v_score, v_comment, rank_score, a_score, created_at, url, "__time"
+    current_score,
+    current_comments,
+    score_velocity_per_minute,
+    comment_velocity_per_minute,
+    score_acceleration,
+    weighted_velocity_rank,
+    story_age,
+    observation_time_ist
+FROM (
+    SELECT
+        post_id,
+        title,
+        author,
+        score AS current_score,
+        num_comments AS current_comments,
+        COALESCE(ROUND(v_score, 2), 0.0) AS score_velocity_per_minute,
+        COALESCE(ROUND(v_comment, 2), 0.0) AS comment_velocity_per_minute,
+        COALESCE(ROUND(rank_score, 4), 0.0) AS weighted_velocity_rank,
+        COALESCE(ROUND(a_score, 4), 0.0) AS score_acceleration,
+        story_age,
+        observation_time_ist,
+        title_link,
+        eligible
+    FROM "hn_snapshots"
+    WHERE latest_flag = 1 
+      AND eligible = 1
+    GROUP BY post_id, title, author, score, num_comments, v_score, v_comment, rank_score, a_score, story_age, observation_time_ist, title_link, eligible
+) sub
 ORDER BY weighted_velocity_rank DESC
-LIMIT 100;
+LIMIT 200;
 
 
 -- ----------------------------------------------------------------------------
@@ -174,94 +166,103 @@ LIMIT 100;
 -- Superset Viz: Table (Top 100, a_score > 0, ranked by a_norm DESC)
 
 SELECT
-    '<a href="' || 
-    CASE 
-        WHEN url IS NOT NULL AND url != '' THEN url 
-        ELSE 'https://news.ycombinator.com/item?id=' || post_id 
-    END || 
-    '" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: none; font-weight: 500;">' || 
-    title || 
-    '</a>' AS title_link,
+    title_link,
     author,
-    score AS current_score,
-    num_comments AS current_comments,
-    COALESCE(ROUND(v_score, 2), 0.0) AS score_velocity_per_minute,
-    COALESCE(ROUND(a_score, 4), 0.0) AS score_acceleration,
-    COALESCE(ROUND(a_norm, 6), 0.0) AS a_norm,
-    COALESCE(ROUND(a_comment, 4), 0.0) AS comment_acceleration,
-    CASE 
-        WHEN (EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) < 3600 
-            THEN CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) / 60.0) AS VARCHAR), 'm')
-        WHEN (EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) < 86400 
-            THEN CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) / 3600.0, 1) AS VARCHAR), 'h')
-        ELSE CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) / 86400.0, 1) AS VARCHAR), 'd')
-    END AS story_age,
-    CONCAT(
-        TIME_FORMAT("__time", 'HH:mm:ss', 'Asia/Kolkata'),
-        ' (',
-        CASE 
-            WHEN (EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) < 60 
-                THEN 'just now'
-            WHEN (EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) < 3600 
-                THEN CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) / 60.0) AS VARCHAR), 'm ago')
-            ELSE 
-                CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) / 3600.0, 1) AS VARCHAR), 'h ago')
-        END,
-        ')'
-    ) AS observation_time_ist
-FROM "hn_snapshots"
-WHERE latest_flag = 1 
-  AND eligible = 1 
-  AND a_score > 0
-GROUP BY post_id, title, author, score, num_comments, v_score, a_score, a_norm, a_comment, created_at, url, "__time"
+    current_score,
+    current_comments,
+    score_velocity_per_minute,
+    score_acceleration,
+    a_norm,
+    comment_acceleration,
+    story_age,
+    observation_time_ist
+FROM (
+    SELECT
+        post_id,
+        title,
+        author,
+        score AS current_score,
+        num_comments AS current_comments,
+        COALESCE(ROUND(v_score, 2), 0.0) AS score_velocity_per_minute,
+        COALESCE(ROUND(a_score, 4), 0.0) AS score_acceleration,
+        COALESCE(ROUND(a_norm, 6), 0.0) AS a_norm,
+        COALESCE(ROUND(a_comment, 4), 0.0) AS comment_acceleration,
+        story_age,
+        observation_time_ist,
+        title_link
+    FROM "hn_snapshots"
+    WHERE latest_flag = 1 
+      AND eligible = 1 
+      AND a_score > 0
+    GROUP BY post_id, title, author, score, num_comments, v_score, a_score, a_norm, a_comment, story_age, observation_time_ist, title_link
+) sub
 ORDER BY a_norm DESC
 LIMIT 100;
 
 
 -- ----------------------------------------------------------------------------
--- QUERY 8: Story Engagement Over Time (Full Trajectory Audit Table)
+-- QUERY 8: Narrative Clusters (Last 6h) (NEW FEATURE)
 -- ----------------------------------------------------------------------------
--- Superset Viz: Table (Observation Time DESC, row limit 500)
+-- Superset Viz: Table (Top 50 clusters ranked by combined velocity)
 
 SELECT
-    CONCAT(
-        TIME_FORMAT("__time", 'HH:mm:ss', 'Asia/Kolkata'),
-        ' (',
-        CASE 
-            WHEN (EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) < 60 
-                THEN 'just now'
-            WHEN (EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) < 3600 
-                THEN CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) / 60.0) AS VARCHAR), 'm ago')
-            ELSE 
-                CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM (SELECT MAX("__time") FROM "hn_snapshots")) - EXTRACT(EPOCH FROM "__time")) / 3600.0, 1) AS VARCHAR), 'h ago')
-        END,
-        ')'
-    ) AS observation_time_ist,
-    '<a href="' || 
-    CASE 
-        WHEN url IS NOT NULL AND url != '' THEN url 
-        ELSE 'https://news.ycombinator.com/item?id=' || post_id 
-    END || 
-    '" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: none; font-weight: 500;">' || 
-    title || 
-    '</a>' AS title_link,
+    cluster_label AS cluster,
+    cluster_id,
+    COUNT(DISTINCT post_id) AS number_of_stories,
+    SUM(score) AS combined_score,
+    ROUND(SUM(COALESCE(v_score, 0.0)), 2) AS combined_velocity,
+    MAX("__time") AS latest_activity_time
+FROM "hn_snapshots"
+WHERE latest_flag = 1
+  AND cluster_label IS NOT NULL
+GROUP BY cluster_label, cluster_id
+ORDER BY combined_velocity DESC
+LIMIT 50;
+
+
+-- ----------------------------------------------------------------------------
+-- QUERY 9: Story Engagement Over Time (Full Trajectory Audit Table)
+-- ----------------------------------------------------------------------------
+-- Superset Viz: Table (Observation Time DESC, row limit 500)
+-- 
+-- [FIX NOTE]:
+--   The previous failing query contained correlated scalar subqueries inside the
+--   projection ((SELECT MAX("__time") FROM "hn_snapshots") inside CONCAT / CASE),
+--   which caused Druid to fail with:
+--   "RUNTIME_FAILURE: Cannot convert query parts into an actual query".
+--
+--   FIXED by precomputing title_link, story_age, and observation_time_ist in Python.
+--   Now executes as a simple scan/group-by ordered by __time DESC.
+
+SELECT
+    observation_time_ist,
+    title_link,
     author,
     score,
     num_comments,
-    COALESCE(ROUND(v_score, 2), 0.0) AS v_score,
-    COALESCE(ROUND(a_score, 4), 0.0) AS a_score,
-    CASE 
-        WHEN (EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) < 3600 
-            THEN CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) / 60.0) AS VARCHAR), 'm')
-        WHEN (EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) < 86400 
-            THEN CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) / 3600.0, 1) AS VARCHAR), 'h')
-        ELSE CONCAT(CAST(ROUND((EXTRACT(EPOCH FROM "__time") - EXTRACT(EPOCH FROM TIME_PARSE(created_at))) / 86400.0, 1) AS VARCHAR), 'd')
-    END AS story_age,
-    post_id,
-    title,
-    "__time"
-FROM "hn_snapshots"
-WHERE "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
-GROUP BY post_id, title, author, score, num_comments, v_score, a_score, created_at, url, "__time"
+    v_score,
+    a_score,
+    story_age
+FROM (
+    SELECT
+        post_id,
+        title,
+        author,
+        score,
+        num_comments,
+        COALESCE(ROUND(v_score, 2), 0.0) AS v_score,
+        COALESCE(ROUND(a_score, 4), 0.0) AS a_score,
+        story_age,
+        observation_time_ist,
+        title_link,
+        cluster_id,
+        cluster_label,
+        dt_sec,
+        eligible,
+        "__time"
+    FROM "hn_snapshots"
+    WHERE "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
+    GROUP BY post_id, title, author, score, num_comments, v_score, a_score, story_age, observation_time_ist, title_link, cluster_id, cluster_label, created_at, url, dt_sec, eligible, "__time"
+) AS virtual_table
 ORDER BY "__time" DESC
 LIMIT 500;

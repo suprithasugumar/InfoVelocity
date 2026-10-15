@@ -16,6 +16,12 @@
           "title",
           "url",
           "created_at",
+          "title_link",
+          "story_age",
+          "observation_time_ist",
+          "quadrant",
+          "cluster_id",
+          "cluster_label",
           {
             "type": "double",
             "name": "dt_sec"
