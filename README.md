@@ -421,6 +421,63 @@ This generates `demo_hn_events.jsonl`, `demo_hn_snapshots.jsonl`, and prints out
 
 ---
 
+## How to Read the Dashboard
+
+The **InfoVelocity** dashboard translates physics-based kinematics into real-time narrative intelligence. Below is a guide on how to interpret each component:
+
+### 1. Header & Executive KPI Summary Cards
+- **Header Live Badges**: Indicates active 10s auto-refresh cadence, Hacker News API connection status, and local IST timestamp of last update.
+- **Epistemic Disclaimer ("Velocity ≠ Veracity")**: Highlights that rapid virality and discussion growth represent information diffusion momentum across the social graph, not factual truth or credibility.
+- **Active Stories**: Total distinct discussion threads observed over the last 6-hour lookback window, accompanied by a 5-minute moving sparkline trend.
+- **Average Score Velocity**: Mean velocity across all active discussions in points/min.
+- **Highest Score Velocity**: The single fastest gaining story by instantaneous upvote velocity.
+- **Current Top Acceleration**: The highest positive surge acceleration ($a_{\text{score}} > 0$) observed in the latest snapshot batch, spotlighting immediate breakouts.
+- **Peak Acceleration (last 6h)**: The absolute maximum surge rate detected across the entire 6-hour observation window (sane capped at 50 pts/min²).
+
+### 2. Analytical Charts & Movement Maps
+- **Engagement Velocity — 5-Minute Trend**:
+  - Dual time-series chart plotting average **Score Velocity** (blue line) and **Comment Velocity** (cyan/green line) aggregated into 5-minute buckets.
+  - Highlights whether platform attention is shifting towards upvoting (agreement/curation) or commenting (discussion/debate).
+- **Momentum Map (Kinematic Scatter Plot)**:
+  - 4-quadrant interactive bubble chart where **X-axis = Score Velocity**, **Y-axis = Score Acceleration**, and **Bubble Size = Score**.
+  - **Quadrants**:
+    - **Breakout (Upper-Right)**: $v > 0, a > 0$ — Stories experiencing accelerating virality. Early detection zone for major breaking stories.
+    - **Cooling (Lower-Right)**: $v > 0, a < 0$ — High velocity but negative acceleration. Popular stories that are maturing and tapering off.
+    - **Steady (Upper-Left/Center)**: $v > 0, a \approx 0$ — Constant, linear community interest.
+    - **Fading / Dormant (Lower-Left)**: $v \le 0, a \le 0$ — Inactive discussions dropping off the front page.
+
+### 3. Ranked Data Tables & Audit Logs
+- **Fastest Growing Narratives (Leaderboard)**:
+  - Ranked by weighted velocity rank ($\text{rank\_score} = v_{\text{score}} \cdot \ln(1 + \text{score})$), which balances high velocity against total community validation.
+  - Features clickable story titles linking directly to the source article (or HN thread fallback).
+  - Post IDs are hidden to maximize screen space; headers are frozen for seamless scrolling.
+- **Breakout Monitor — Positive Acceleration**:
+  - Filtered exclusively for narratives with $a_{\text{score}} > 0$ and ranked by normalized acceleration ($a_{\text{norm}} = a / \text{score}$).
+  - Cell backgrounds are conditionally formatted with rich green highlights for acceleration surges.
+- **Story Engagement Over Time (Full Trajectory Audit)**:
+  - Comprehensive snapshot log sorted latest-first (**Observation Time DESC**) displaying local IST timestamps with relative age (e.g., `22:41:46 (2m ago)`) and story publication age (e.g., `1.5h`).
+  - Native filters on **Story Title** and **Post ID** allow users to isolate and trace the complete historical trajectory of any given story across consecutive observation rounds.
+
+---
+
+## Screenshot Checklist & Verification
+
+When reviewing or presenting the dashboard UI at 1080p resolution, verify the following elements:
+
+- [ ] **Header Emojis & Badges**: All emojis (`⚡ 🔴 ⏱️ 📡`) render cleanly in UTF-8 without question mark (`???`) artifacts.
+- [ ] **Disclaimer Banner**: Expandable epistemic notice (`Velocity ≠ Veracity`) with details dropdown.
+- [ ] **5 KPI Cards**: Row 1 contains 5 cards aligned with equal heights (Active Stories, Avg Velocity, Peak Velocity, Current Top Accel, Peak Accel (6h)).
+- [ ] **Sparkline Trendlines**: Active Stories and Velocity cards display mini trendlines without errors.
+- [ ] **Macro Trend**: ECharts time-series line chart plots 5-minute velocity moving windows without negative dips.
+- [ ] **Momentum Map**: Bubble chart plots stories across 4 quadrants with legend color coding and bubble size scaling with score.
+- [ ] **Leaderboard Table**: Clickable title links, hidden Post ID, frozen header, no horizontal scrolling needed at 1080p, row limit 100 (no yellow warning).
+- [ ] **Breakout Monitor**: Displays positive surges with green conditional formatting, row limit 100 (no yellow warning).
+- [ ] **Audit Table**: Chronologically sorted Observation Time DESC, relative timestamps (`2m ago`), story age (`1.2h`), row limit 500 (no yellow warning).
+- [ ] **Native Filter Panel**: Left filter panel includes Time Window, Min Score, Author, Story Title, and Post ID.
+- [ ] **Zero Data Errors**: All charts return HTTP 200 with zero planning/SQL errors.
+
+---
+
 ## Limitations & Future Roadmap
 
 ### Current Limitations
@@ -432,6 +489,7 @@ This generates `demo_hn_events.jsonl`, `demo_hn_snapshots.jsonl`, and prints out
 - **Streaming Ingestion**: Transition from batch snapshot files to an event streaming broker for sub-second ingestion latency.
 - **Cross-Platform Adapters**: Add modular ingestion connectors for open discussion platforms (e.g., Bluesky, Mastodon, Lemmy) while preserving the shared velocity calculus.
 - **Automated Webhook Alerts**: Implement webhook notifications triggered when $a_{\text{score}}$ exceeds configurable standard deviation thresholds.
+
 
 
 

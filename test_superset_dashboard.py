@@ -48,8 +48,10 @@ with app.app_context():
         "Active Stories",
         "Average Score Velocity",
         "Highest Score Velocity",
-        "Highest Positive Acceleration",
+        "Current Top Acceleration",
+        "Peak Acceleration",
         "5-Minute Trend",
+        "Momentum Map",
         "Fastest Growing Narratives",
         "Breakout Monitor",
         "Story Engagement Over Time"
@@ -97,7 +99,7 @@ with app.app_context():
             print(f"Status: FAILED - {e}")
 
     if all_passed:
-        print("\n[ALL 8 SLICES PASSED] InfoVelocity Dashboard & KPI Visualizations Fully Operational!")
+        print("\n[ALL 10 SLICES PASSED] InfoVelocity Dashboard & Visualizations Fully Operational!")
     else:
         print("\n[TESTS FAILED] One or more chart queries or slices failed.")
         exit(1)
