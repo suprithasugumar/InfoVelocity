@@ -1,0 +1,61 @@
+{
+  "type": "index_parallel",
+  "spec": {
+    "dataSchema": {
+      "dataSource": "hn_clusters",
+      "timestampSpec": {
+        "column": "timestamp",
+        "format": "iso"
+      },
+      "dimensionsSpec": {
+        "dimensions": [
+          "cluster_id",
+          "cluster",
+          "top_title",
+          "latest_activity_time",
+          {
+            "type": "long",
+            "name": "number_of_stories"
+          },
+          {
+            "type": "long",
+            "name": "combined_score"
+          },
+          {
+            "type": "double",
+            "name": "combined_velocity"
+          }
+        ]
+      },
+      "metricsSpec": [
+        {
+          "type": "count",
+          "name": "count"
+        }
+      ],
+      "granularitySpec": {
+        "type": "uniform",
+        "segmentGranularity": "DAY",
+        "queryGranularity": "NONE",
+        "rollup": false
+      }
+    },
+    "ioConfig": {
+      "type": "index_parallel",
+      "inputSource": {
+        "type": "local",
+        "baseDir": "/opt/shared",
+        "filter": "hn_clusters.jsonl"
+      },
+      "inputFormat": {
+        "type": "json"
+      },
+      "appendToExisting": false
+    },
+    "tuningConfig": {
+      "type": "index_parallel",
+      "maxRowsInMemory": 100000,
+      "maxRowsPerSegment": 5000000
+    }
+  }
+}

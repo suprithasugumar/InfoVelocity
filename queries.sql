@@ -1,6 +1,6 @@
 -- ============================================================================
 -- InfoVelocity: Real-Time Narrative Velocity & Acceleration SQL
--- Datasource: "hn_snapshots" (Apache Druid OLAP Engine)
+-- Datasource: "hn_snapshots" and "hn_clusters" (Apache Druid OLAP Engine)
 -- Target UI: Apache Superset Dashboards & Real-Time Alerts
 -- Time Column: "__time" (Ingestion snapshot observation timestamp)
 -- ============================================================================
@@ -18,8 +18,11 @@
 --   - story_age            : Human-readable publication age ('45m', '1.5h', '2.0d')
 --   - observation_time_ist : Observation time formatted in IST ('15:43:08')
 --   - quadrant             : 4-quadrant momentum classification string
---   - cluster_id           : Narrative cluster identifier ('cluster_ai', 'cluster_security')
---   - cluster_label        : Narrative cluster display label ('AI & Large Language Models')
+--
+-- NOTE:
+--   Narrative clusters are maintained in a dedicated "hn_clusters" datasource
+--   (min 2 stories per cluster, grouped by title similarity first), keeping
+--   story snapshot rows pure and unpolluted.
 -- ============================================================================
 
 
@@ -105,7 +108,7 @@ ORDER BY bucket_time ASC;
 -- ----------------------------------------------------------------------------
 -- QUERY 5: Momentum Map (Kinematic 4-Quadrant Scatter / Bubble Chart)
 -- ----------------------------------------------------------------------------
--- Superset Viz: bubble_v2 (x = v_score, y = a_score, size = sqrt(score), series = quadrant)
+-- Superset Viz: bubble_v2 (x = v_score, y = a_score, size = sqrt(score) capped, series = quadrant)
 
 SELECT 
     title,
@@ -113,7 +116,9 @@ SELECT
     quadrant,
     AVG(score_velocity_per_minute) AS x_velocity,
     AVG(score_acceleration) AS y_acceleration,
-    CASE WHEN AVG(score_velocity_per_minute) = 0 AND AVG(score_acceleration) = 0 THEN 1.0 ELSE ROUND(SQRT(GREATEST(MAX(current_score), 1)), 2) END AS bubble_size_sqrt
+    CASE WHEN AVG(score_velocity_per_minute) = 0 THEN 1.5 
+         ELSE LEAST(ROUND(SQRT(GREATEST(MAX(current_score), 1)), 2), 25.0) 
+    END AS bubble_size_sqrt
 FROM (
     SELECT
         post_id,
@@ -127,17 +132,18 @@ FROM (
     WHERE latest_flag = 1 
       AND eligible = 1
       AND "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
+      AND v_score IS NOT NULL
     GROUP BY post_id, title, author, score, v_score, a_score, quadrant
 ) sub
 GROUP BY title, author, quadrant
 ORDER BY x_velocity DESC
-LIMIT 200;
+LIMIT 500;
 
 
 -- ----------------------------------------------------------------------------
 -- QUERY 6: Real-Time Narrative Leaderboard (Fastest Growing Stories)
 -- ----------------------------------------------------------------------------
--- Superset Viz: Table (Top 200, ranked by weighted rank_score DESC)
+-- Superset Viz: Table (Top 500, ranked by weighted rank_score DESC)
 
 SELECT
     title_link,
@@ -171,13 +177,13 @@ FROM (
     GROUP BY post_id, title, author, score, num_comments, v_score, v_comment, rank_score, a_score, story_age, observation_time_ist, title_link, eligible
 ) sub
 ORDER BY weighted_velocity_rank DESC
-LIMIT 200;
+LIMIT 500;
 
 
 -- ----------------------------------------------------------------------------
 -- QUERY 7: Top Accelerating "Breakout" Stories (Positive Surge Detector)
 -- ----------------------------------------------------------------------------
--- Superset Viz: Table (Top 100, a_score > 0, ranked by a_norm DESC)
+-- Superset Viz: Table (Top 500, a_score > 0, ranked by a_norm DESC)
 
 SELECT
     title_link,
@@ -211,25 +217,24 @@ FROM (
     GROUP BY post_id, title, author, score, num_comments, v_score, a_score, a_norm, a_comment, story_age, observation_time_ist, title_link
 ) sub
 ORDER BY a_norm DESC
-LIMIT 100;
+LIMIT 500;
 
 
 -- ----------------------------------------------------------------------------
--- QUERY 8: Narrative Clusters (Last 6h) (NEW FEATURE)
+-- QUERY 8: Narrative Clusters (Last 6h) (Dedicated hn_clusters Datasource)
 -- ----------------------------------------------------------------------------
--- Superset Viz: Table (Top 50 clusters ranked by combined velocity)
+-- Superset Viz: Table (Top 50 clusters with min 2 stories)
 
 SELECT
-    cluster_label AS cluster,
+    cluster,
     cluster_id,
-    COUNT(DISTINCT post_id) AS number_of_stories,
-    SUM(score) AS combined_score,
-    ROUND(SUM(COALESCE(v_score, 0.0)), 2) AS combined_velocity,
-    MAX("__time") AS latest_activity_time
-FROM "hn_snapshots"
-WHERE latest_flag = 1
-  AND cluster_label IS NOT NULL
-GROUP BY cluster_label, cluster_id
+    number_of_stories,
+    combined_score,
+    combined_velocity,
+    top_title,
+    latest_activity_time
+FROM "hn_clusters"
+WHERE number_of_stories >= 2
 ORDER BY combined_velocity DESC
 LIMIT 50;
 
@@ -237,16 +242,7 @@ LIMIT 50;
 -- ----------------------------------------------------------------------------
 -- QUERY 9: Story Engagement Over Time (Full Trajectory Audit Table)
 -- ----------------------------------------------------------------------------
--- Superset Viz: Table (Observation Time DESC, row limit 500)
--- 
--- [FIX NOTE]:
---   The previous failing query contained correlated scalar subqueries inside the
---   projection ((SELECT MAX("__time") FROM "hn_snapshots") inside CONCAT / CASE),
---   which caused Druid to fail with:
---   "RUNTIME_FAILURE: Cannot convert query parts into an actual query".
---
---   FIXED by precomputing title_link, story_age, and observation_time_ist in Python.
---   Now executes as a simple scan/group-by ordered by __time DESC.
+-- Superset Viz: Table (Observation Time DESC, row limit 1000)
 
 SELECT
     observation_time_ist,
@@ -269,14 +265,12 @@ FROM (
         story_age,
         observation_time_ist,
         title_link,
-        cluster_id,
-        cluster_label,
         dt_sec,
         eligible,
         "__time"
     FROM "hn_snapshots"
     WHERE "__time" >= (SELECT MAX("__time") - INTERVAL '6' HOUR FROM "hn_snapshots")
-    GROUP BY post_id, title, author, score, num_comments, v_score, a_score, story_age, observation_time_ist, title_link, cluster_id, cluster_label, created_at, url, dt_sec, eligible, "__time"
+    GROUP BY post_id, title, author, score, num_comments, v_score, a_score, story_age, observation_time_ist, title_link, created_at, url, dt_sec, eligible, "__time"
 ) AS virtual_table
 ORDER BY "__time" DESC
-LIMIT 500;
+LIMIT 1000;

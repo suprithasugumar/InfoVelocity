@@ -7,14 +7,9 @@ Polls the Hacker News Firebase REST API:
 2. Maintains an active pool of recent stories within a sliding time window.
 3. Periodically re-fetches engagement metrics for all active stories and writes
    timestamped observations to hn_snapshots.jsonl for velocity & acceleration tracking.
-
-Key Features:
-- Dual-target output:
-  * hn_events.jsonl: Immutable first-seen story catalog (deduplicated by post_id)
-  * hn_snapshots.jsonl: Time-series engagement snapshots (multiple observations per post_id)
-- Observation timestamp ('timestamp') vs. story publication timestamp ('created_at')
-- Configurable active window hours and story limit
-- Offline demo mode with simulated engagement growth across polling cycles
+4. Pre-computes kinematics and automatically syncs to Apache Druid continuously.
+5. Emits heartbeats on every polling cycle for service liveness monitoring.
+6. Explicit isolated demo mode via --demo flag targeting hn_snapshots_sim (never mixing with real data).
 """
 
 import os
@@ -23,12 +18,18 @@ import json
 import time
 import logging
 import argparse
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import OrderedDict
 import requests
 from dotenv import load_dotenv
-from compute_kinematics import StoryKinematicsTracker, compute_file_kinematics
+
+from compute_kinematics import (
+    StoryKinematicsTracker,
+    compute_file_kinematics,
+    fix_mojibake
+)
 
 # Load environment variables
 load_dotenv()
@@ -46,14 +47,60 @@ logging.basicConfig(
 logger = logging.getLogger("InfoVelocityHNCollector")
 
 HN_BASE_URL = "https://hacker-news.firebaseio.com/v0"
+INDEXER_URL = os.getenv("DRUID_OVERLORD_URL", "http://localhost:8081")
+CONTAINER_NAME = "middlemanager"
+
+
+def format_iso_timestamp(epoch: int | float | None) -> str:
+    """Converts a unix timestamp to UTC ISO 8601 string."""
+    if epoch is not None:
+        dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def sync_to_druid(data_file: str, spec_file: str, datasource_name: str) -> bool:
+    """Copies JSONL file to middlemanager container and triggers Druid batch ingestion."""
+    if not os.path.exists(data_file):
+        logger.warning(f"[Druid Sync] Data file {data_file} does not exist. Skipping sync.")
+        return False
+
+    target_path = f"/opt/shared/{os.path.basename(data_file)}"
+    try:
+        # Copy to container
+        res = subprocess.run(
+            ["docker", "cp", data_file, f"{CONTAINER_NAME}:{target_path}"],
+            capture_output=True,
+            text=True
+        )
+        if res.returncode != 0:
+            logger.error(f"[Druid Sync] Failed to copy {data_file} to container: {res.stderr}")
+            return False
+
+        # Read ingestion spec
+        if not os.path.exists(spec_file):
+            logger.error(f"[Druid Sync] Spec file {spec_file} not found.")
+            return False
+
+        with open(spec_file, "r", encoding="utf-8") as f:
+            spec = json.load(f)
+
+        task_url = f"{INDEXER_URL}/druid/indexer/v1/task"
+        resp = requests.post(task_url, json=spec, timeout=10)
+        if resp.status_code == 200:
+            task_id = resp.json().get("task")
+            logger.info(f"[Druid Sync] Submitted ingestion task for '{datasource_name}' (Task ID: {task_id})")
+            return True
+        else:
+            logger.warning(f"[Druid Sync] Task submission returned {resp.status_code}: {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"[Druid Sync] Exception during sync: {e}")
+        return False
 
 
 def load_seen_ids_and_active_pool(events_file: str, active_window_hours: int = 12, active_limit: int = 100) -> tuple[set, OrderedDict]:
-    """
-    Reads existing events file to:
-    1. Load all historical post_ids into seen_ids to prevent duplicate catalog entries.
-    2. Seed the active story pool with recent stories within the active window.
-    """
+    """Reads existing events catalog to populate seen_ids and seed active_pool."""
     seen = set()
     active_pool = OrderedDict()
     events_path = Path(events_file)
@@ -76,7 +123,6 @@ def load_seen_ids_and_active_pool(events_file: str, active_window_hours: int = 1
                         continue
                     seen.add(post_id)
 
-                    # Extract timestamp or created_at for active pool qualification
                     ts_str = data.get("created_at") or data.get("timestamp")
                     if ts_str:
                         try:
@@ -89,7 +135,6 @@ def load_seen_ids_and_active_pool(events_file: str, active_window_hours: int = 1
                 except json.JSONDecodeError:
                     continue
 
-        # Enforce max capacity on seeded active pool (keep newest)
         if len(active_pool) > active_limit:
             excess = len(active_pool) - active_limit
             for _ in range(excess):
@@ -106,7 +151,6 @@ def load_seen_ids_and_active_pool(events_file: str, active_window_hours: int = 1
 def fetch_new_story_ids(limit: int = 25, timeout: int = 10) -> list:
     """Fetches active trending and latest story IDs from Hacker News API."""
     story_ids = []
-    # 1. Fetch top/trending stories with active upvotes & comments
     try:
         r_top = requests.get(f"{HN_BASE_URL}/topstories.json", timeout=timeout)
         if r_top.ok and isinstance(r_top.json(), list):
@@ -114,7 +158,6 @@ def fetch_new_story_ids(limit: int = 25, timeout: int = 10) -> list:
     except Exception as e:
         logger.warning(f"Failed to fetch top stories: {e}")
 
-    # 2. Also fetch newest stories
     try:
         r_new = requests.get(f"{HN_BASE_URL}/newstories.json", timeout=timeout)
         if r_new.ok and isinstance(r_new.json(), list):
@@ -128,23 +171,15 @@ def fetch_new_story_ids(limit: int = 25, timeout: int = 10) -> list:
 
 
 def fetch_item_details(item_id: str | int, timeout: int = 10) -> dict | None:
-    """Fetches details for a specific item from Hacker News /v0/item/{id}.json."""
+    """Fetches details for a specific item from Hacker News API."""
     url = f"{HN_BASE_URL}/item/{item_id}.json"
     try:
         response = requests.get(url, timeout=timeout)
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        logger.error(f"Failed to fetch item {item_id} details: {e}")
+        logger.debug(f"Failed to fetch item {item_id}: {e}")
         return None
-
-
-def format_iso_timestamp(epoch: int | float | None) -> str:
-    """Converts a unix timestamp to UTC ISO 8601 string."""
-    if epoch is not None:
-        dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def prune_active_pool(active_pool: OrderedDict, active_window_hours: int = 12, active_limit: int = 100) -> int:
@@ -152,12 +187,10 @@ def prune_active_pool(active_pool: OrderedDict, active_window_hours: int = 12, a
     now_epoch = datetime.now(timezone.utc).timestamp()
     cutoff_epoch = now_epoch - (active_window_hours * 3600)
 
-    # Remove stories older than active window
     expired_ids = [pid for pid, created_epoch in active_pool.items() if created_epoch < cutoff_epoch]
     for pid in expired_ids:
         del active_pool[pid]
 
-    # Enforce limit (evict oldest stories)
     while len(active_pool) > active_limit:
         active_pool.popitem(last=False)
 
@@ -186,13 +219,12 @@ def poll_cycle_live(
     posts_per_poll: int = 25,
     active_window_hours: int = 12,
     active_limit: int = 100,
-    kinematics_tracker: StoryKinematicsTracker = None
+    kinematics_tracker: StoryKinematicsTracker = None,
+    poll_interval: int = 60,
+    auto_sync: bool = True,
+    is_demo: bool = False
 ) -> tuple[int, int]:
-    """
-    Executes a dual-phase polling cycle:
-    1. Discovery: Find new stories, append to hn_events.jsonl, and register in active_pool.
-    2. Snapshot: Re-poll all stories in active_pool and append current metrics to hn_snapshots.jsonl.
-    """
+    """Executes a dual-phase polling cycle with heartbeat and automatic continuous Druid sync."""
     now_dt = datetime.now(timezone.utc)
     current_snapshot_ts = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     now_epoch = now_dt.timestamp()
@@ -217,13 +249,13 @@ def poll_cycle_live(
         created_epoch = item_data.get("time") or now_epoch
         created_iso = format_iso_timestamp(created_epoch)
         post_url = item_data.get("url") or f"https://news.ycombinator.com/item?id={str_id}"
+        clean_title = fix_mojibake(str(item_data.get("title") or "").strip())
 
-        # Catalog event record (immutable first-seen)
         catalog_record = {
             "post_id": str_id,
             "timestamp": created_iso,
             "created_at": created_iso,
-            "title": str(item_data.get("title") or "").strip(),
+            "title": clean_title,
             "body": str(item_data.get("text") or ""),
             "author": str(item_data.get("by") or "[deleted]"),
             "source": "hackernews",
@@ -236,7 +268,7 @@ def poll_cycle_live(
         seen_ids.add(str_id)
         active_pool[str_id] = created_epoch
 
-    if new_catalog_events:
+    if new_catalog_events and not is_demo:
         try:
             with open(events_file, "a", encoding="utf-8") as f:
                 for post in new_catalog_events:
@@ -244,8 +276,6 @@ def poll_cycle_live(
             logger.info(f"[Catalog] Saved {len(new_catalog_events)} new stories to {events_file}.")
         except IOError as e:
             logger.error(f"Failed to write to {events_file}: {e}")
-    else:
-        logger.info("[Catalog] No new stories discovered in this cycle.")
 
     # --- Prune Active Pool ---
     pruned_count = prune_active_pool(active_pool, active_window_hours, active_limit)
@@ -266,12 +296,13 @@ def poll_cycle_live(
         created_epoch = item_data.get("time") or active_pool.get(str_id, now_epoch)
         created_iso = format_iso_timestamp(created_epoch)
         post_url = item_data.get("url") or f"https://news.ycombinator.com/item?id={str_id}"
+        clean_title = fix_mojibake(str(item_data.get("title") or "").strip())
 
         snapshot_record = {
             "post_id": str_id,
-            "timestamp": current_snapshot_ts,  # Current observation timestamp
-            "created_at": created_iso,         # Original publication timestamp
-            "title": str(item_data.get("title") or "").strip(),
+            "timestamp": current_snapshot_ts,
+            "created_at": created_iso,
+            "title": clean_title,
             "author": str(item_data.get("by") or "[deleted]"),
             "source": "hackernews",
             "subreddit": "hackernews",
@@ -289,17 +320,32 @@ def poll_cycle_live(
                 for snap in snapshots:
                     f.write(json.dumps(snap, ensure_ascii=False) + "\n")
             logger.info(f"[Snapshot] Saved {len(snapshots)} engagement snapshots to {snapshots_file} (ts={current_snapshot_ts}).")
-            # Ensure file-level kinematics and latest_flags are computed
-            compute_file_kinematics(snapshots_file, poll_interval=kinematics_tracker.poll_interval if kinematics_tracker else 300)
+
+            # Recompute kinematics & separate clusters dataset
+            compute_file_kinematics(snapshots_file, poll_interval=poll_interval)
+
+            # Continuous sync to Druid
+            if auto_sync:
+                ds_name = "hn_snapshots_sim" if is_demo else "hn_snapshots"
+                spec_name = "druid_snapshots_sim_ingestion_spec.json" if is_demo else "druid_snapshots_ingestion_spec.json"
+                sync_to_druid(snapshots_file, spec_name, ds_name)
+
+                # Also sync clusters if live
+                if not is_demo and os.path.exists("hn_clusters.jsonl"):
+                    sync_to_druid("hn_clusters.jsonl", "druid_clusters_ingestion_spec.json", "hn_clusters")
+
         except IOError as e:
             logger.error(f"Failed to write to {snapshots_file}: {e}")
+
+    # Emit Heartbeat
+    logger.info(f"[HEARTBEAT] Collector active | Polled at {current_snapshot_ts} | Pool: {len(active_pool)} stories | Status: HEALTHY | Mode: {'DEMO/SIM' if is_demo else 'LIVE'}")
 
     return len(new_catalog_events), len(snapshots)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="InfoVelocity - Stage 1 & Snapshot Collector: Hacker News",
+        description="InfoVelocity - Hacker News Continuous Collector Service",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
@@ -309,13 +355,13 @@ def main():
     )
     parser.add_argument(
         "--snapshots-output",
-        default=os.getenv("SNAPSHOT_FILE", "hn_snapshots.jsonl"),
-        help="Path to engagement snapshots JSONL file."
+        default=None,
+        help="Path to engagement snapshots JSONL file (default: hn_snapshots.jsonl or hn_snapshots_sim.jsonl if demo)."
     )
     parser.add_argument(
         "--interval",
         type=int,
-        default=int(os.getenv("POLL_INTERVAL_SECONDS", "300")),
+        default=int(os.getenv("POLL_INTERVAL_SECONDS", "60")),
         help="Interval in seconds between polling cycles."
     )
     parser.add_argument(
@@ -344,31 +390,45 @@ def main():
         default=0,
         help="Number of polling cycles to run (0 = run continuously)."
     )
+    parser.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="Disable automatic continuous sync to Druid."
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run in isolated demo/simulated mode. Writes to hn_snapshots_sim and never mixes with real data."
+    )
     args = parser.parse_args()
 
+    if args.demo:
+        snapshots_file = args.snapshots_output or "hn_snapshots_sim.jsonl"
+        mode_label = "DEMO / SIMULATED (Target: hn_snapshots_sim)"
+    else:
+        snapshots_file = args.snapshots_output or os.getenv("SNAPSHOT_FILE", "hn_snapshots.jsonl")
+        mode_label = "LIVE Hacker News API (Target: hn_snapshots)"
+
     logger.info("=================================================================")
-    logger.info("  InfoVelocity - Hacker News Snapshot & Event Collector          ")
+    logger.info("  InfoVelocity - Hacker News Continuous Collector Service         ")
     logger.info("=================================================================")
     logger.info(f"API Endpoint         : {HN_BASE_URL}")
-    logger.info(f"Events Catalog File  : {args.output}")
-    logger.info(f"Snapshots File       : {args.snapshots_output}")
+    logger.info(f"Catalog File         : {args.output}")
+    logger.info(f"Snapshots File       : {snapshots_file}")
     logger.info(f"Polling Interval     : {args.interval} seconds")
-    logger.info(f"Posts Per Poll       : {args.limit}")
     logger.info(f"Active Story Limit   : {args.active_limit}")
-    logger.info(f"Active Window Hours  : {args.active_window_hours} hours")
-    logger.info(f"Cycles Target        : {'Continuous' if args.cycles == 0 else args.cycles}")
-    logger.info("Mode                 : Live Hacker News API")
+    logger.info(f"Mode                 : {mode_label}")
+    logger.info(f"Auto Druid Sync      : {'Disabled' if args.no_sync else 'Continuous'}")
+    logger.info("=================================================================")
 
-    # Seed seen IDs and active story pool from existing events catalog
     seen_ids, active_pool = load_seen_ids_and_active_pool(
         args.output,
         active_window_hours=args.active_window_hours,
         active_limit=args.active_limit
     )
 
-    # Initialize kinematics tracker and seed from existing snapshots
     kinematics_tracker = StoryKinematicsTracker(poll_interval=args.interval)
-    kinematics_tracker.seed_from_file(args.snapshots_output)
+    kinematics_tracker.seed_from_file(snapshots_file)
 
     cycle_count = 0
     total_new_events = 0
@@ -381,13 +441,16 @@ def main():
 
             new_ev, new_snap = poll_cycle_live(
                 args.output,
-                args.snapshots_output,
+                snapshots_file,
                 seen_ids,
                 active_pool,
                 posts_per_poll=args.limit,
                 active_window_hours=args.active_window_hours,
                 active_limit=args.active_limit,
-                kinematics_tracker=kinematics_tracker
+                kinematics_tracker=kinematics_tracker,
+                poll_interval=args.interval,
+                auto_sync=not args.no_sync,
+                is_demo=args.demo
             )
 
             total_new_events += new_ev

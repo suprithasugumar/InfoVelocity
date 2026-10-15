@@ -1,0 +1,106 @@
+{
+  "type": "index_parallel",
+  "spec": {
+    "dataSchema": {
+      "dataSource": "hn_snapshots_sim",
+      "timestampSpec": {
+        "column": "timestamp",
+        "format": "iso"
+      },
+      "dimensionsSpec": {
+        "dimensions": [
+          "post_id",
+          "author",
+          "source",
+          "subreddit",
+          "title",
+          "url",
+          "created_at",
+          "title_link",
+          "story_age",
+          "observation_time_ist",
+          "quadrant",
+          {
+            "type": "double",
+            "name": "dt_sec"
+          },
+          {
+            "type": "double",
+            "name": "v_score"
+          },
+          {
+            "type": "double",
+            "name": "v_comment"
+          },
+          {
+            "type": "double",
+            "name": "a_score"
+          },
+          {
+            "type": "double",
+            "name": "a_comment"
+          },
+          {
+            "type": "double",
+            "name": "a_norm"
+          },
+          {
+            "type": "double",
+            "name": "rank_score"
+          },
+          {
+            "type": "long",
+            "name": "eligible"
+          },
+          {
+            "type": "long",
+            "name": "latest_flag"
+          },
+          {
+            "type": "long",
+            "name": "is_capped"
+          }
+        ]
+      },
+      "metricsSpec": [
+        {
+          "type": "count",
+          "name": "count"
+        },
+        {
+          "type": "longSum",
+          "name": "score",
+          "fieldName": "score"
+        },
+        {
+          "type": "longSum",
+          "name": "num_comments",
+          "fieldName": "num_comments"
+        }
+      ],
+      "granularitySpec": {
+        "type": "uniform",
+        "segmentGranularity": "HOUR",
+        "queryGranularity": "NONE",
+        "rollup": false
+      }
+    },
+    "ioConfig": {
+      "type": "index_parallel",
+      "inputSource": {
+        "type": "local",
+        "baseDir": "/opt/shared",
+        "filter": "hn_snapshots_sim.jsonl"
+      },
+      "inputFormat": {
+        "type": "json"
+      },
+      "appendToExisting": false
+    },
+    "tuningConfig": {
+      "type": "index_parallel",
+      "maxRowsInMemory": 100000,
+      "maxRowsPerSegment": 5000000
+    }
+  }
+}

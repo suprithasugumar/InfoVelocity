@@ -100,6 +100,7 @@ def submit_task(spec_file: str):
 def main():
     parser = argparse.ArgumentParser(description="Submit batch ingestion specs to Apache Druid.")
     parser.add_argument("--snapshots", action="store_true", help="Ingest hn_snapshots.jsonl using druid_snapshots_ingestion_spec.json")
+    parser.add_argument("--clusters", action="store_true", help="Ingest hn_clusters.jsonl using druid_clusters_ingestion_spec.json")
     parser.add_argument("--data", default=None, help="Custom data file path")
     parser.add_argument("--spec", default=None, help="Custom spec file path")
     args = parser.parse_args()
@@ -108,6 +109,10 @@ def main():
         data_file = "hn_snapshots.jsonl"
         spec_file = "druid_snapshots_ingestion_spec.json"
         target_path = "/opt/shared/hn_snapshots.jsonl"
+    elif args.clusters:
+        data_file = "hn_clusters.jsonl"
+        spec_file = "druid_clusters_ingestion_spec.json"
+        target_path = "/opt/shared/hn_clusters.jsonl"
     elif args.data and args.spec:
         data_file = args.data
         spec_file = args.spec
